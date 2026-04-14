@@ -43,6 +43,7 @@ class Mamba(nn.Module):
         dt_init_floor=1e-4,
         conv_bias=True,
         bias=False,
+        selective_read=True,
         use_fast_path=True,  # Fused kernel options
         layer_idx=None,
         device=None,
@@ -56,6 +57,7 @@ class Mamba(nn.Module):
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+        self.selective_read = selective_read
         self.use_fast_path = use_fast_path
         self.layer_idx = layer_idx
 
@@ -74,9 +76,13 @@ class Mamba(nn.Module):
         self.activation = "silu"
         self.act = nn.SiLU()
 
-        self.x_proj = nn.Linear(
-            self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
-        )
+        x_proj_out_dim = self.dt_rank + self.d_state * (2 if self.selective_read else 1)
+        self.x_proj = nn.Linear(self.d_inner, x_proj_out_dim, bias=False, **factory_kwargs)
+        if not self.selective_read:
+            self.C = nn.Parameter(
+                torch.empty(self.d_inner, self.d_state, device=device, dtype=torch.float32)
+            )
+            nn.init.uniform_(self.C, -self.d_state**-0.5, self.d_state**-0.5)
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
 
         # Initialize special dt projection to preserve variance at initialization
@@ -153,7 +159,7 @@ class Mamba(nn.Module):
                 self.out_proj.bias,
                 A,
                 None,  # input-dependent B
-                None,  # input-dependent C
+                None if self.selective_read else self.C.float(),
                 self.D.float(),
                 delta_bias=self.dt_proj.bias.float(),
                 delta_softplus=True,
@@ -180,11 +186,15 @@ class Mamba(nn.Module):
             # We want dt to have d as the slowest moving dimension
             # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
             x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))  # (bl d)
-            dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+            if self.selective_read:
+                dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+                C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+            else:
+                dt, B = torch.split(x_dbl, [self.dt_rank, self.d_state], dim=-1)
+                C = self.C.float()
             dt = self.dt_proj.weight @ dt.t()
             dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
             B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-            C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             assert self.activation in ["silu", "swish"]
             y = selective_scan_fn(
                 x,
@@ -228,20 +238,27 @@ class Mamba(nn.Module):
                 self.activation,
             )
 
-        x_db = self.x_proj(x)  # (B dt_rank+2*d_state)
-        dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        x_db = self.x_proj(x)  # (B dt_rank+d_state[+d_state if selective read])
+        if self.selective_read:
+            dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        else:
+            dt, B = torch.split(x_db, [self.dt_rank, self.d_state], dim=-1)
+            C = self.C
         # Don't add dt_bias here
         dt = F.linear(dt, self.dt_proj.weight)  # (B d_inner)
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
 
         # SSM step
-        if selective_state_update is None:
+        if selective_state_update is None or not self.selective_read:
             # Discretize A and B
             dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
             dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
             dB = torch.einsum("bd,bn->bdn", dt, B)
             ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)
-            y = torch.einsum("bdn,bn->bd", ssm_state.to(dtype), C)
+            if self.selective_read:
+                y = torch.einsum("bdn,bn->bd", ssm_state.to(dtype), C)
+            else:
+                y = torch.einsum("bdn,dn->bd", ssm_state.to(dtype), C.to(dtype))
             y = y + self.D.to(dtype) * x
             y = y * self.act(z)  # (B D)
         else:
