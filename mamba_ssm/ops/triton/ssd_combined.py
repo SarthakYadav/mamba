@@ -1413,7 +1413,7 @@ class MambaSplitConv1dScanCombinedStaticCFn(torch.autograd.Function):
         B = rearrange(B, "b l (g n) -> b l g n", g=ctx.ngroups)
         z = rearrange(z, "b l (h p) -> b l h p", h=nheads)
         dzxbcdt = torch.empty_like(zxbcdt)
-        dz, dxBC_given, ddt_given = torch.split(dzxbcdt, [dim, xBC_dim, nheads], dim=-1)
+        dz_given, dxBC_given, ddt_given = torch.split(dzxbcdt, [dim, xBC_dim, nheads], dim=-1)
         dxBC = torch.empty_like(xBC)
         dx, dB = torch.split(dxBC, [dim, ctx.ngroups * dstate], dim=-1)
         dx = rearrange(dx, "b l (h p) -> b l h p", h=nheads)
@@ -1423,7 +1423,6 @@ class MambaSplitConv1dScanCombinedStaticCFn(torch.autograd.Function):
             dout = F.linear(dout, outproj_weight.t())
         if rmsnorm_weight is None:
             dout = rearrange(dout, "b s (h p) -> b s h p", p=headdim)
-            dz = rearrange(dz, "b l (h p) -> b l h p", h=nheads)
             dx, ddt, dA, dB, dstatic_C, dD, dz, ddt_bias, dinitial_states, *rest = _mamba_chunk_scan_static_c_reduced_bwd(
                 dout,
                 x,
@@ -1442,12 +1441,14 @@ class MambaSplitConv1dScanCombinedStaticCFn(torch.autograd.Function):
                 dt_limit=ctx.dt_limit,
                 recompute_output=recompute_output,
             )
+            dz_given.copy_(rearrange(dz, "b l h p -> b l (h p)"))
+            ddt_given.copy_(ddt)
             out_for_linear = rearrange(rest[0], "b s h p -> b s (h p)") if recompute_output else None
             drmsnorm_weight = None
         else:
             batch = dout.shape[0]
             dy_rms = rearrange(dout, "b s d -> (b s) d")
-            dz_rms = rearrange(dz, "b l d -> (b l) d")
+            dz_rms = rearrange(dz_given, "b l d -> (b l) d")
             x_rms = rearrange(out, "b s h p -> (b s) (h p)")
             z_rms = rearrange(z, "b s h p -> (b s) (h p)")
             out_linear = rearrange(out_recompute, "b s d -> (b s) d") if recompute_output else None
@@ -1487,6 +1488,8 @@ class MambaSplitConv1dScanCombinedStaticCFn(torch.autograd.Function):
                 dt_softplus=True,
                 dt_limit=ctx.dt_limit,
             )
+            dz_given.copy_(dz)
+            ddt_given.copy_(ddt)
         if outproj_weight is not None:
             doutproj_weight = torch.einsum("bso,bsd->od", dout_og, out_for_linear)
             doutproj_bias = dout_og.sum(dim=(0, 1)) if outproj_bias is not None else None
