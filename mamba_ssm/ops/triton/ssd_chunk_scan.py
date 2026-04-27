@@ -1967,9 +1967,9 @@ _REDUCED_CHUNK_SCAN_BWD_MIN_BLOCK_N = 32
 
 @triton.autotune(
     configs=autotune_configs([
-        triton.Config({"BLOCK_SIZE_N": 32}, num_warps=2, pre_hook=init_to_zero(["ddA_ptr"])),
-        triton.Config({"BLOCK_SIZE_N": 64}, num_warps=4, pre_hook=init_to_zero(["ddA_ptr"])),
-        triton.Config({"BLOCK_SIZE_N": 128}, num_warps=4, pre_hook=init_to_zero(["ddA_ptr"])),
+        triton.Config({"BLOCK_SIZE_N": 32}, num_warps=2, pre_hook=init_to_zero(["ddA_ptr", "dD_ptr"])),
+        triton.Config({"BLOCK_SIZE_N": 64}, num_warps=4, pre_hook=init_to_zero(["ddA_ptr", "dD_ptr"])),
+        triton.Config({"BLOCK_SIZE_N": 128}, num_warps=4, pre_hook=init_to_zero(["ddA_ptr", "dD_ptr"])),
     ]),
     key=["hdim", "chunk_size"],
 )
