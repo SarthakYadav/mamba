@@ -32,6 +32,8 @@ class BenchmarkResult:
     d_model: int
     ms: float | None
     toks_per_sec: float | None
+    benchmark_group: str = "matrix"
+    static_c_impl: str | None = None
     error: str | None = None
 
 
@@ -43,7 +45,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--batch", type=int, default=4)
-    parser.add_argument("--seq-lens", type=int, nargs="+", default=[128, 512, 2048])
+    parser.add_argument("--seq-lens", type=int, nargs="+", default=[128, 512, 2048, 4096])
     parser.add_argument("--d-models", type=int, nargs="+", default=[256, 512, 1024])
     parser.add_argument("--passes", choices=["forward", "forward_backward"], nargs="+", default=["forward", "forward_backward"])
     parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="bfloat16")
@@ -100,6 +102,7 @@ def make_model(
     headdim: int,
     ngroups: int,
     selective_read: bool,
+    static_c_impl: str | None,
     device: str,
     dtype: torch.dtype,
 ) -> torch.nn.Module:
@@ -115,7 +118,7 @@ def make_model(
             dtype=dtype,
         )
     if family == "mamba2_simple":
-        return Mamba2Simple(
+        model = Mamba2Simple(
             d_model=d_model,
             d_state=d_state,
             d_conv=d_conv,
@@ -127,6 +130,8 @@ def make_model(
             device=device,
             dtype=dtype,
         )
+        model._static_c_impl = "auto" if static_c_impl is None else static_c_impl
+        return model
     raise ValueError(f"Unsupported family: {family}")
 
 
@@ -138,6 +143,8 @@ def run_case(
     *,
     family: str,
     selective_read: bool,
+    static_c_impl: str | None,
+    benchmark_group: str,
     pass_name: str,
     batch: int,
     seqlen: int,
@@ -161,6 +168,7 @@ def run_case(
         headdim=headdim,
         ngroups=ngroups,
         selective_read=selective_read,
+        static_c_impl=static_c_impl,
         device=device,
         dtype=dtype,
     )
@@ -194,6 +202,8 @@ def run_case(
         d_model=d_model,
         ms=ms,
         toks_per_sec=toks_per_sec,
+        benchmark_group=benchmark_group,
+        static_c_impl=static_c_impl,
     )
 
 
@@ -257,6 +267,34 @@ def print_shape_block(
                 )
 
 
+def print_static_c_impl_block(
+    results: list[BenchmarkResult],
+    *,
+    pass_name: str,
+    batch: int,
+    seqlen: int,
+    d_model: int,
+) -> None:
+    if not results:
+        return
+    print()
+    print(f"[{pass_name}] static-C impl batch={batch} seqlen={seqlen} d_model={d_model}")
+    print(f"{'impl':<14} {'ms':>12} {'tok/s':>16} {'collapsed/legacy':>18}")
+    by_impl = {r.static_c_impl: r for r in results}
+    legacy = by_impl.get("legacy_ssd")
+    collapsed = by_impl.get("collapsed")
+    for impl in ["legacy_ssd", "collapsed"]:
+        result = by_impl.get(impl)
+        print(
+            f"{impl:<14} "
+            f"{format_metric(result.ms if result is not None else None):>12} "
+            f"{format_metric(result.toks_per_sec if result is not None else None):>16} "
+            f"{format_speedup(collapsed, legacy) if impl == 'collapsed' else '':>18}"
+        )
+        if result is not None and result.error is not None:
+            print(f"  note: {impl}: {result.error}")
+
+
 def validate_args(args: argparse.Namespace) -> None:
     if "mamba2_simple" in args.families:
         for d_model in args.d_models:
@@ -298,6 +336,8 @@ def main() -> None:
                             result = run_case(
                                 family=family,
                                 selective_read=selective_read,
+                                static_c_impl=None,
+                                benchmark_group="matrix",
                                 pass_name=pass_name,
                                 batch=args.batch,
                                 seqlen=seqlen,
@@ -324,6 +364,7 @@ def main() -> None:
                                 d_model=d_model,
                                 ms=None,
                                 toks_per_sec=None,
+                                benchmark_group="matrix",
                                 error=f"{type(exc).__name__}: {exc}",
                             )
                         shape_results.append(result)
@@ -336,6 +377,54 @@ def main() -> None:
                     seqlen=seqlen,
                     d_model=d_model,
                 )
+                static_c_impl_results: list[BenchmarkResult] = []
+                if "mamba2_simple" in args.families:
+                    for static_c_impl in ["legacy_ssd", "collapsed"]:
+                        try:
+                            result = run_case(
+                                family="mamba2_simple",
+                                selective_read=False,
+                                static_c_impl=static_c_impl,
+                                benchmark_group="static_c_impl",
+                                pass_name=pass_name,
+                                batch=args.batch,
+                                seqlen=seqlen,
+                                d_model=d_model,
+                                d_state=args.d_state,
+                                d_conv=args.d_conv,
+                                expand=args.expand,
+                                headdim=args.headdim,
+                                ngroups=args.ngroups,
+                                device=device,
+                                dtype=dtype,
+                                warmup=args.warmup,
+                                rep=args.rep,
+                            )
+                        except Exception as exc:
+                            if args.strict:
+                                raise
+                            result = BenchmarkResult(
+                                family="mamba2_simple",
+                                selective_read=False,
+                                pass_name=pass_name,
+                                batch=args.batch,
+                                seqlen=seqlen,
+                                d_model=d_model,
+                                ms=None,
+                                toks_per_sec=None,
+                                benchmark_group="static_c_impl",
+                                static_c_impl=static_c_impl,
+                                error=f"{type(exc).__name__}: {exc}",
+                            )
+                        static_c_impl_results.append(result)
+                        all_results.append(result)
+                    print_static_c_impl_block(
+                        static_c_impl_results,
+                        pass_name=pass_name,
+                        batch=args.batch,
+                        seqlen=seqlen,
+                        d_model=d_model,
+                    )
 
     if args.json_out is not None:
         with open(args.json_out, "w") as f:

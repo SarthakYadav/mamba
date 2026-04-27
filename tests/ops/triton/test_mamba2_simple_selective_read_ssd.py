@@ -23,13 +23,13 @@ def _clone_inputs(*args):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("ngroups", [1, 2])
-def test_mamba2_simple_static_c_wrapper_parity(dtype, ngroups):
+@pytest.mark.parametrize("seqlen", [32, 128])
+def test_mamba2_simple_static_c_wrapper_parity(dtype, ngroups, seqlen):
     _require_fused_wrapper()
     torch.manual_seed(0)
 
     device = "cuda"
     batch = 2
-    seqlen = 32
     nheads = 4
     headdim = 32
     dim = nheads * headdim
@@ -98,3 +98,84 @@ def test_mamba2_simple_static_c_wrapper_parity(dtype, ngroups):
         assert torch.isfinite(grad).all(), f"non-finite grad for {name}"
         assert torch.isfinite(grad_ref).all(), f"non-finite reference grad for {name}"
         assert torch.allclose(grad.float(), grad_ref.float(), atol=atol, rtol=rtol), f"{name} grad mismatch"
+
+
+def _make_static_c_case(dtype):
+    device = "cuda"
+    batch = 2
+    seqlen = 32
+    nheads = 4
+    headdim = 32
+    dim = nheads * headdim
+    dstate = 8
+    dconv = 4
+    ngroups = 2
+    chunk_size = 16
+    zxbcdt = torch.randn(batch, seqlen, 2 * dim + ngroups * dstate + nheads, device=device, dtype=dtype) / 5
+    conv1d_weight = torch.randn(dim + ngroups * dstate, dconv, device=device, dtype=dtype) / 5
+    conv1d_bias = torch.randn(dim + ngroups * dstate, device=device, dtype=dtype) / 5
+    dt_bias = torch.randn(nheads, device=device, dtype=dtype) / 5
+    A = -torch.exp(torch.randn(nheads, device=device, dtype=torch.float32) / 5)
+    D = torch.randn(nheads, device=device, dtype=torch.float32) / 5
+    static_C = torch.randn(ngroups, dstate, device=device, dtype=dtype) / 5
+    return {
+        "zxbcdt": zxbcdt,
+        "conv1d_weight": conv1d_weight,
+        "conv1d_bias": conv1d_bias,
+        "dt_bias": dt_bias,
+        "A": A,
+        "D": D,
+        "chunk_size": chunk_size,
+        "activation": "silu",
+        "headdim": headdim,
+        "ngroups": ngroups,
+        "static_C": static_C,
+    }
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mamba2_simple_static_c_wrapper_seq_idx_falls_back_to_legacy(dtype):
+    _require_fused_wrapper()
+    torch.manual_seed(1)
+
+    kwargs = _make_static_c_case(dtype)
+    seq_idx = torch.arange(kwargs["zxbcdt"].shape[1], device="cuda", dtype=torch.int32).expand(
+        kwargs["zxbcdt"].shape[0], -1
+    )
+    out = mamba_split_conv1d_scan_combined(seq_idx=seq_idx, _static_c_impl="auto", **kwargs)
+    out_legacy = mamba_split_conv1d_scan_combined(seq_idx=seq_idx, _static_c_impl="legacy_ssd", **kwargs)
+    assert torch.allclose(out.float(), out_legacy.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mamba2_simple_static_c_wrapper_initial_states_falls_back_to_legacy(dtype):
+    _require_fused_wrapper()
+    torch.manual_seed(2)
+
+    kwargs = _make_static_c_case(dtype)
+    batch = kwargs["zxbcdt"].shape[0]
+    nheads = kwargs["D"].shape[0]
+    headdim = kwargs["headdim"]
+    dstate = kwargs["static_C"].shape[-1]
+    initial_states = torch.randn(batch, nheads, headdim, dstate, device="cuda", dtype=dtype) / 5
+    out = mamba_split_conv1d_scan_combined(initial_states=initial_states, _static_c_impl="auto", **kwargs)
+    out_legacy = mamba_split_conv1d_scan_combined(
+        initial_states=initial_states, _static_c_impl="legacy_ssd", **kwargs
+    )
+    assert torch.allclose(out.float(), out_legacy.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mamba2_simple_static_c_wrapper_return_final_states_falls_back_to_legacy(dtype):
+    _require_fused_wrapper()
+    torch.manual_seed(3)
+
+    kwargs = _make_static_c_case(dtype)
+    out, final_states = mamba_split_conv1d_scan_combined(
+        return_final_states=True, _static_c_impl="auto", **kwargs
+    )
+    out_legacy, final_states_legacy = mamba_split_conv1d_scan_combined(
+        return_final_states=True, _static_c_impl="legacy_ssd", **kwargs
+    )
+    assert torch.allclose(out.float(), out_legacy.float(), atol=1e-2, rtol=1e-2)
+    assert torch.allclose(final_states.float(), final_states_legacy.float(), atol=1e-2, rtol=1e-2)

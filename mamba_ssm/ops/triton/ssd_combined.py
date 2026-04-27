@@ -824,6 +824,136 @@ def _repeat_static_c(static_C, batch, seqlen):
     return repeat(static_C, "g n -> b l g n", b=batch, l=seqlen)
 
 
+_STATIC_C_IMPLS = {"auto", "legacy_ssd", "collapsed"}
+
+
+def _static_c_layout(zxbcdt, conv1d_weight, dt_bias, D, headdim, ngroups, static_C):
+    if D.dim() == 1:
+        assert headdim is not None
+        nheads, = D.shape
+    else:
+        nheads, headdim = D.shape
+    batch, seqlen, _ = zxbcdt.shape
+    dim = nheads * headdim
+    dstate = (conv1d_weight.shape[0] - dim) // ngroups
+    xBC_dim = dim + ngroups * dstate
+    d_nonssm = (zxbcdt.shape[-1] - 2 * dim - ngroups * dstate - nheads) // 2
+    assert d_nonssm >= 0
+    assert static_C.shape == (ngroups, dstate)
+    assert zxbcdt.shape == (batch, seqlen, 2 * d_nonssm + 2 * dim + ngroups * dstate + nheads)
+    assert dt_bias.shape == (nheads,)
+    return batch, seqlen, nheads, headdim, dim, dstate, d_nonssm, xBC_dim
+
+
+def _can_use_collapsed_static_c(
+    zxbcdt,
+    conv1d_weight,
+    dt_bias,
+    D,
+    *,
+    initial_states,
+    seq_idx,
+    return_final_states,
+    activation,
+    headdim,
+    ngroups,
+    static_C,
+):
+    if static_C is None:
+        return False, "static_C is not set"
+    if initial_states is not None:
+        return False, "initial_states is only supported by the legacy SSD path"
+    if seq_idx is not None:
+        return False, "seq_idx is only supported by the legacy SSD path"
+    if return_final_states:
+        return False, "return_final_states is only supported by the legacy SSD path"
+    if causal_conv1d_fn is None:
+        return False, "causal_conv1d_fn is unavailable"
+    if activation not in [None, "silu", "swish"]:
+        return False, f"unsupported activation for collapsed static-C path: {activation}"
+    try:
+        from mamba_ssm.ops.selective_scan_interface import selective_scan_fn  # noqa: F401
+    except Exception as exc:  # pragma: no cover - environment-dependent
+        return False, f"selective_scan_fn is unavailable: {exc}"
+    _, _, _, _, _, _, d_nonssm, _ = _static_c_layout(
+        zxbcdt, conv1d_weight, dt_bias, D, headdim, ngroups, static_C
+    )
+    if d_nonssm != 0:
+        return False, "collapsed static-C path only supports the Mamba2Simple layout"
+    return True, None
+
+
+def _mamba_split_conv1d_scan_static_c_collapsed(
+    zxbcdt,
+    conv1d_weight,
+    conv1d_bias,
+    dt_bias,
+    A,
+    D,
+    *,
+    dt_limit,
+    activation,
+    rmsnorm_weight,
+    rmsnorm_eps,
+    outproj_weight,
+    outproj_bias,
+    headdim,
+    ngroups,
+    norm_before_gate,
+    static_C,
+):
+    batch, seqlen, nheads, headdim, dim, dstate, d_nonssm, xBC_dim = _static_c_layout(
+        zxbcdt, conv1d_weight, dt_bias, D, headdim, ngroups, static_C
+    )
+    if d_nonssm != 0:
+        raise ValueError("Collapsed static-C path only supports the Mamba2Simple layout")
+    z = zxbcdt[..., :dim]
+    xBC = zxbcdt[..., dim:dim + xBC_dim]
+    dt = zxbcdt[..., dim + xBC_dim:dim + xBC_dim + nheads]
+    xBC = rearrange(
+        causal_conv1d_fn(
+            rearrange(ensure_stride(xBC), "b s d -> b d s"),
+            conv1d_weight,
+            conv1d_bias,
+            activation=activation,
+        ),
+        "b d s -> b s d",
+    )
+    x, B = torch.split(xBC, [dim, ngroups * dstate], dim=-1)
+    x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
+    B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
+    alpha = torch.einsum("b l g n, g n -> b l g", B, static_C.to(dtype=B.dtype))
+    reduced_B = alpha.unsqueeze(-1)
+    reduced_C = alpha.new_ones(*alpha.shape, 1)
+    z = rearrange(z, "b l (h p) -> b l h p", h=nheads)
+    out = ssd_selective_scan(
+        x,
+        dt.to(dtype=x.dtype),
+        A,
+        reduced_B,
+        reduced_C,
+        D=D.float(),
+        z=z if rmsnorm_weight is None else None,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        dt_limit=dt_limit,
+    )
+    out = rearrange(out, "b s h p -> b s (h p)")
+    if rmsnorm_weight is not None:
+        out = rmsnorm_fn(
+            out,
+            rmsnorm_weight,
+            None,
+            z=rearrange(z, "b l h p -> b l (h p)"),
+            eps=rmsnorm_eps,
+            group_size=dim // ngroups,
+            norm_before_gate=norm_before_gate,
+        )
+    if outproj_weight is not None:
+        out = F.linear(out, outproj_weight, outproj_bias)
+    return out
+
+
 class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
 
     @staticmethod
@@ -1018,7 +1148,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None, dstatic_C
 
 
-def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True, static_C=None):
+def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True, static_C=None, _static_c_impl="auto"):
     """
     Argument:
         zxbcdt: (batch, seqlen, 2 * dim + [1 or 2] * ngroups * dstate + nheads)
@@ -1037,9 +1167,67 @@ def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias
         norm_before_gate: if True, we do RMSNorm(x) * F.silu(z). If False, we do RMSNorm(x * F.silu(z))
         static_C: (ngroups, dstate) or None. If set, the conv branch packs [x, B] and uses
             this tensor as the static read projection.
+        _static_c_impl: Internal testing/benchmark override for the static-C path. One of
+            {"auto", "legacy_ssd", "collapsed"}.
     Return:
         out: (batch, seqlen, dim)
     """
+    if _static_c_impl not in _STATIC_C_IMPLS:
+        raise ValueError(f"Unsupported _static_c_impl: {_static_c_impl}")
+    if static_C is not None and _static_c_impl != "legacy_ssd":
+        can_use_collapsed, reason = _can_use_collapsed_static_c(
+            zxbcdt,
+            conv1d_weight,
+            dt_bias,
+            D,
+            initial_states=initial_states,
+            seq_idx=seq_idx,
+            return_final_states=return_final_states,
+            activation=activation,
+            headdim=headdim,
+            ngroups=ngroups,
+            static_C=static_C,
+        )
+        if _static_c_impl == "collapsed":
+            if not can_use_collapsed:
+                raise ValueError(f"Collapsed static-C path is unsupported here: {reason}")
+            return _mamba_split_conv1d_scan_static_c_collapsed(
+                zxbcdt,
+                conv1d_weight,
+                conv1d_bias,
+                dt_bias,
+                A,
+                D,
+                dt_limit=dt_limit,
+                activation=activation,
+                rmsnorm_weight=rmsnorm_weight,
+                rmsnorm_eps=rmsnorm_eps,
+                outproj_weight=outproj_weight,
+                outproj_bias=outproj_bias,
+                headdim=headdim,
+                ngroups=ngroups,
+                norm_before_gate=norm_before_gate,
+                static_C=static_C,
+            )
+        if can_use_collapsed:
+            return _mamba_split_conv1d_scan_static_c_collapsed(
+                zxbcdt,
+                conv1d_weight,
+                conv1d_bias,
+                dt_bias,
+                A,
+                D,
+                dt_limit=dt_limit,
+                activation=activation,
+                rmsnorm_weight=rmsnorm_weight,
+                rmsnorm_eps=rmsnorm_eps,
+                outproj_weight=outproj_weight,
+                outproj_bias=outproj_bias,
+                headdim=headdim,
+                ngroups=ngroups,
+                norm_before_gate=norm_before_gate,
+                static_C=static_C,
+            )
     return MambaSplitConv1dScanCombinedFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate, static_C)
 
 

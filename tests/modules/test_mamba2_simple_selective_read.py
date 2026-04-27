@@ -105,3 +105,52 @@ def test_mamba2_simple_selective_read_false_fused_forward_backward(dtype):
     assert torch.isfinite(x.grad).all()
     assert model.C.grad is not None
     assert torch.isfinite(model.C.grad).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mamba2_simple_selective_read_false_fused_matches_nonfused(dtype):
+    _require_fused_path()
+    torch.manual_seed(2)
+
+    batch, seqlen, d_model = 2, 64, 64
+    model_ref = Mamba2Simple(
+        d_model=d_model,
+        d_state=8,
+        d_conv=4,
+        expand=2,
+        headdim=32,
+        ngroups=2,
+        selective_read=False,
+        use_mem_eff_path=False,
+        device="cuda",
+        dtype=dtype,
+    )
+    model = Mamba2Simple(
+        d_model=d_model,
+        d_state=8,
+        d_conv=4,
+        expand=2,
+        headdim=32,
+        ngroups=2,
+        selective_read=False,
+        use_mem_eff_path=True,
+        device="cuda",
+        dtype=dtype,
+    )
+    model.load_state_dict(model_ref.state_dict())
+
+    x = torch.randn(batch, seqlen, d_model, device="cuda", dtype=dtype, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+
+    y = model(x)
+    y_ref = model_ref(x_ref)
+
+    assert torch.allclose(y.float(), y_ref.float(), atol=1e-2, rtol=1e-2)
+
+    y.float().square().mean().backward()
+    y_ref.float().square().mean().backward()
+
+    assert torch.allclose(x.grad.float(), x_ref.grad.float(), atol=1e-2, rtol=1e-2)
+    assert torch.allclose(model.C.grad.float(), model_ref.C.grad.float(), atol=1e-2, rtol=1e-2)
+    assert torch.allclose(model.dt_bias.grad.float(), model_ref.dt_bias.grad.float(), atol=1e-2, rtol=1e-2)
+    assert torch.allclose(model.A_log.grad.float(), model_ref.A_log.grad.float(), atol=1e-2, rtol=1e-2)

@@ -68,6 +68,8 @@ class Mamba2Simple(nn.Module):
         self.chunk_size = chunk_size
         self.use_mem_eff_path = use_mem_eff_path
         self.layer_idx = layer_idx
+        # Private benchmarking/testing hook for the static-C fused path.
+        self._static_c_impl = "auto"
 
         # Order: [z, x, B, C, dt] or [z, x, B, dt] when using a static read projection.
         d_in_proj = 2 * self.d_inner + self.ngroups * self.d_state * (2 if self.selective_read else 1) + self.nheads
@@ -160,6 +162,7 @@ class Mamba2Simple(nn.Module):
                 norm_before_gate=False,
                 initial_states=initial_states,
                 static_C=self.C if not self.selective_read else None,
+                _static_c_impl=self._static_c_impl,
                 **dt_limit_kwargs,
             )
         else:
