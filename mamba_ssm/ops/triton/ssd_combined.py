@@ -813,13 +813,17 @@ def mamba_conv1d_scan_ref(xBC, conv1d_weight, conv1d_bias, dt, A, chunk_size, D=
     return rearrange(out, "b s h p -> b s (h p)")
 
 
+def _repeat_static_c(static_C, batch, seqlen):
+    return repeat(static_C, "g n -> b l g n", b=batch, l=seqlen)
+
+
 class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
 
     @staticmethod
     @custom_fwd
     def forward(ctx, zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu",
                 rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None,
-                ngroups=1, norm_before_gate=True):
+                ngroups=1, norm_before_gate=True, static_C=None):
         assert activation in [None, "silu", "swish"]
         if D.dim() == 1:
             assert headdim is not None
@@ -829,23 +833,38 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         batch, seqlen, _ = zxbcdt.shape
         dim = nheads * headdim
         assert nheads % ngroups == 0
-        dstate = (conv1d_weight.shape[0] - dim) // ngroups // 2
-        d_nonssm = (zxbcdt.shape[-1] - 2 * dim - 2 * ngroups * dstate - nheads) // 2
+        has_static_C = static_C is not None
+        if has_static_C:
+            assert static_C.shape == (ngroups, (conv1d_weight.shape[0] - dim) // ngroups)
+            dstate = (conv1d_weight.shape[0] - dim) // ngroups
+            xBC_dim = dim + ngroups * dstate
+            d_nonssm = (zxbcdt.shape[-1] - 2 * dim - ngroups * dstate - nheads) // 2
+            expected_shape = (batch, seqlen, 2 * d_nonssm + 2 * dim + ngroups * dstate + nheads)
+        else:
+            dstate = (conv1d_weight.shape[0] - dim) // ngroups // 2
+            xBC_dim = dim + 2 * ngroups * dstate
+            d_nonssm = (zxbcdt.shape[-1] - 2 * dim - 2 * ngroups * dstate - nheads) // 2
+            expected_shape = (batch, seqlen, 2 * d_nonssm + 2 * dim + 2 * ngroups * dstate + nheads)
         assert d_nonssm >= 0
-        assert zxbcdt.shape == (batch, seqlen, 2 * d_nonssm + 2 * dim + 2 * ngroups * dstate + nheads)
+        assert (conv1d_weight.shape[0] - dim) == ngroups * dstate * (1 if has_static_C else 2)
+        assert zxbcdt.shape == expected_shape
         assert dt_bias.shape == (nheads,)
         assert A.shape == (nheads,)
-        zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + ngroups * dstate * 2, nheads], dim=-1)
+        zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, xBC_dim, nheads], dim=-1)
         seq_idx = seq_idx.contiguous() if seq_idx is not None else None
         xBC_conv = rearrange(
             causal_conv1d_fwd_function(rearrange(ensure_stride(xBC), "b s d -> b d s"),
                 conv1d_weight, conv1d_bias, seq_idx, None, None, activation in ["silu", "swish"]),
             "b d s -> b s d"
         )
-        x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+        if has_static_C:
+            x, B = torch.split(xBC_conv, [dim, ngroups * dstate], dim=-1)
+            C = _repeat_static_c(static_C, batch, seqlen)
+        else:
+            x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+            C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
         B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
-        C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
         z = rearrange(z, "b l (h p) -> b l h p", h=nheads) if z is not None else None
         if rmsnorm_weight is None:
             out, out_x, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=dt_limit)
@@ -881,8 +900,10 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             out = F.linear(out, outproj_weight, outproj_bias)
         else:
             assert outproj_bias is None
+        saved_static_C = static_C if static_C is not None else zxbcdt.new_empty(0)
         ctx.save_for_backward(zxbcdt, conv1d_weight, conv1d_bias,
-                              out_x, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias)
+                              out_x, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias, saved_static_C)
+        ctx.has_static_C = has_static_C
         ctx.dt_limit = dt_limit
         ctx.return_final_states = return_final_states
         ctx.activation = activation
@@ -896,38 +917,52 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
     @staticmethod
     @custom_bwd
     def backward(ctx, dout, *args):
-        zxbcdt, conv1d_weight, conv1d_bias, out, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias = ctx.saved_tensors
+        zxbcdt, conv1d_weight, conv1d_bias, out, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias, saved_static_C = ctx.saved_tensors
         dfinal_states = args[0] if ctx.return_final_states else None
         headdim = ctx.headdim
         nheads = D.shape[0]
         dim = nheads * headdim
         assert nheads % ctx.ngroups == 0
-        dstate = (conv1d_weight.shape[0] - dim) // ctx.ngroups // 2
-        d_nonssm = (zxbcdt.shape[-1] - 2 * dim - 2 * ctx.ngroups * dstate - nheads) // 2
+        if ctx.has_static_C:
+            dstate = (conv1d_weight.shape[0] - dim) // ctx.ngroups
+            xBC_dim = dim + ctx.ngroups * dstate
+            d_nonssm = (zxbcdt.shape[-1] - 2 * dim - ctx.ngroups * dstate - nheads) // 2
+        else:
+            dstate = (conv1d_weight.shape[0] - dim) // ctx.ngroups // 2
+            xBC_dim = dim + 2 * ctx.ngroups * dstate
+            d_nonssm = (zxbcdt.shape[-1] - 2 * dim - 2 * ctx.ngroups * dstate - nheads) // 2
         assert d_nonssm >= 0
         recompute_output = outproj_weight is not None
         if recompute_output:
             out_recompute = torch.empty(*out.shape[:2], d_nonssm + dim, device=out.device, dtype=out.dtype)
             out0_recompute, out1_recompute = out_recompute.split([d_nonssm, dim], dim=-1)
-        zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1)
-        # Recompute x, B, C
+        zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, xBC_dim, nheads], dim=-1)
+        # Recompute x, B, C.
         xBC_conv = rearrange(
             causal_conv1d_fwd_function(rearrange(ensure_stride(xBC), "b s d -> b d s"),
                 conv1d_weight, conv1d_bias, seq_idx, None, None, ctx.activation in ["silu", "swish"]),
             "b d s -> b s d"
         )
-        x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+        if ctx.has_static_C:
+            x, B = torch.split(xBC_conv, [dim, ctx.ngroups * dstate], dim=-1)
+            C = _repeat_static_c(saved_static_C, zxbcdt.shape[0], zxbcdt.shape[1])
+        else:
+            x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+            C = rearrange(C, "b l (g n) -> b l g n", g=ctx.ngroups)
         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
         B = rearrange(B, "b l (g n) -> b l g n", g=ctx.ngroups)
-        C = rearrange(C, "b l (g n) -> b l g n", g=ctx.ngroups)
         dzxbcdt = torch.empty_like(zxbcdt)
-        dzx0, dz, dxBC_given, ddt_given = torch.split(dzxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1)
+        dzx0, dz, dxBC_given, ddt_given = torch.split(dzxbcdt, [2 * d_nonssm, dim, xBC_dim, nheads], dim=-1)
         dxBC = torch.empty_like(xBC)
-        dx, dB, dC = torch.split(dxBC, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+        if ctx.has_static_C:
+            dx, dB = torch.split(dxBC, [dim, ctx.ngroups * dstate], dim=-1)
+            dC = None
+        else:
+            dx, dB, dC = torch.split(dxBC, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+            dC = rearrange(dC, "b l (g n) -> b l g n", g=ctx.ngroups)
         z = rearrange(z, "b l (h p) -> b l h p", h=nheads)
         dx = rearrange(dx, "b l (h p) -> b l h p", h=nheads)
         dB = rearrange(dB, "b l (g n) -> b l g n", g=ctx.ngroups)
-        dC = rearrange(dC, "b l (g n) -> b l g n", g=ctx.ngroups)
         if outproj_weight is not None:
             dout_og = dout
             dout = F.linear(dout, outproj_weight.t())
@@ -937,7 +972,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         dout = rearrange(dout, "b s (h p) -> b s h p", p=headdim)
         if rmsnorm_weight is None:
             dz = rearrange(dz, "b l (h p) -> b l h p", h=nheads)
-            dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states, *rest = _mamba_chunk_scan_combined_bwd(
+            dx, ddt, dA, dB, dC_out, dD, dz, ddt_bias, dinitial_states, *rest = _mamba_chunk_scan_combined_bwd(
                 dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit, dx=dx, ddt=ddt_given, dB=dB, dC=dC, dz=dz, recompute_output=recompute_output
             )
             out_for_linear = rearrange(rest[0], "b s h p -> b s (h p)") if recompute_output else None
@@ -952,9 +987,10 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             dout, drmsnorm_weight, _, dz, *rest = _layer_norm_bwd(dy_rms, x_rms, rmsnorm_weight, None, ctx.rmsnorm_eps, None, rstd, z_rms, group_size=dim//ctx.ngroups, norm_before_gate=ctx.norm_before_gate, is_rms_norm=True, recompute_output=recompute_output, dz=dz, out=out1_recompute if recompute_output else None)
             out_for_linear = out_recompute if recompute_output else None
             dout = rearrange(dout, "(b s) (h p) -> b s h p", b=batch, p=headdim)
-            dx, ddt, dA, dB, dC, dD, _, ddt_bias, dinitial_states = _mamba_chunk_scan_combined_bwd(
+            dx, ddt, dA, dB, dC_out, dD, _, ddt_bias, dinitial_states = _mamba_chunk_scan_combined_bwd(
                 dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=None, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit, dx=dx, ddt=ddt_given, dB=dB, dC=dC
             )
+        dstatic_C = dC_out.sum(dim=(0, 1)).to(saved_static_C.dtype) if ctx.has_static_C else None
 
         if outproj_weight is not None:
             doutproj_weight = torch.einsum("bso,bsd->od", dout_og, out_for_linear)
@@ -972,15 +1008,16 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             dxBC_given.copy_(dxBC_given_update)
         else:
             dxBC_given = dxBC_given_update
-        return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None
+        return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None, dstatic_C
 
 
-def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True):
+def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True, static_C=None):
     """
     Argument:
-        zxbcdt: (batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads) where dim == nheads * headdim
-        conv1d_weight: (dim + 2 * ngroups * dstate, width)
-        conv1d_bias: (dim + 2 * ngroups * dstate,)
+        zxbcdt: (batch, seqlen, 2 * dim + [1 or 2] * ngroups * dstate + nheads)
+            where dim == nheads * headdim.
+        conv1d_weight: (dim + [1 or 2] * ngroups * dstate, width)
+        conv1d_bias: (dim + [1 or 2] * ngroups * dstate,)
         dt_bias: (nheads,)
         A: (nheads)
         D: (nheads, headdim) or (nheads,)
@@ -991,18 +1028,21 @@ def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias
         outproj_bias: (out_dim,)
         headdim: if D is 1D, headdim must be passed in
         norm_before_gate: if True, we do RMSNorm(x) * F.silu(z). If False, we do RMSNorm(x * F.silu(z))
+        static_C: (ngroups, dstate) or None. If set, the conv branch packs [x, B] and uses
+            this tensor as the static read projection.
     Return:
         out: (batch, seqlen, dim)
     """
-    return MambaSplitConv1dScanCombinedFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate)
+    return MambaSplitConv1dScanCombinedFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate, static_C)
 
 
-def mamba_split_conv1d_scan_ref(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, dt_limit=(0.0, float("inf")), activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True):
+def mamba_split_conv1d_scan_ref(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, dt_limit=(0.0, float("inf")), activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True, static_C=None):
     """
     Argument:
-        zxbcdt: (batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads) where dim == nheads * headdim
-        conv1d_weight: (dim + 2 * ngroups * dstate, width)
-        conv1d_bias: (dim + 2 * ngroups * dstate,)
+        zxbcdt: (batch, seqlen, 2 * dim + [1 or 2] * ngroups * dstate + nheads)
+            where dim == nheads * headdim.
+        conv1d_weight: (dim + [1 or 2] * ngroups * dstate, width)
+        conv1d_bias: (dim + [1 or 2] * ngroups * dstate,)
         dt_bias: (nheads,)
         A: (nheads)
         D: (nheads, headdim) or (nheads,)
@@ -1011,6 +1051,8 @@ def mamba_split_conv1d_scan_ref(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, 
         outproj_bias: (out_dim,)
         headdim: if D is 1D, headdim must be passed in
         norm_before_gate: if True, we do RMSNorm(x) * F.silu(z). If False, we do RMSNorm(x * F.silu(z))
+        static_C: (ngroups, dstate) or None. If set, the conv branch packs [x, B] and uses
+            this tensor as the static read projection.
     Return:
         out: (batch, seqlen, dim)
     """
@@ -1022,19 +1064,31 @@ def mamba_split_conv1d_scan_ref(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, 
     assert nheads % ngroups == 0
     batch, seqlen, _ = zxbcdt.shape
     dim = nheads * headdim
-    dstate = (zxbcdt.shape[-1] - 2 * dim - nheads) // ngroups // 2
-    assert zxbcdt.shape == (batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads)
+    has_static_C = static_C is not None
+    if has_static_C:
+        dstate = (conv1d_weight.shape[0] - dim) // ngroups
+        xBC_dim = dim + ngroups * dstate
+        assert static_C.shape == (ngroups, dstate)
+        assert zxbcdt.shape == (batch, seqlen, 2 * dim + ngroups * dstate + nheads)
+    else:
+        dstate = (conv1d_weight.shape[0] - dim) // ngroups // 2
+        xBC_dim = dim + 2 * ngroups * dstate
+        assert zxbcdt.shape == (batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads)
     assert dt_bias.shape == (nheads,)
     assert A.shape == (nheads,)
     if rmsnorm_weight is not None:
         assert rmsnorm_weight.shape == (dim,)
-    z, xBC, dt = torch.split(zxbcdt, [dim, dim + 2 * ngroups * dstate, nheads], dim=-1)
+    z, xBC, dt = torch.split(zxbcdt, [dim, xBC_dim, nheads], dim=-1)
     xBC = rearrange(causal_conv1d_fn(rearrange(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias, activation=activation),
                     "b d s -> b s d")
-    x, B, C = torch.split(xBC, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+    if has_static_C:
+        x, B = torch.split(xBC, [dim, ngroups * dstate], dim=-1)
+        C = _repeat_static_c(static_C, batch, seqlen)
+    else:
+        x, B, C = torch.split(xBC, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+        C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
     x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
     B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
-    C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
     z = rearrange(z, "b l (h p) -> b l h p", h=nheads)
     out = ssd_selective_scan(x, dt.to(x.dtype), A, B, C, D=D.float(),
                              z=z if rmsnorm_weight is None else None, dt_bias=dt_bias, dt_softplus=True, dt_limit=dt_limit)
@@ -1045,4 +1099,3 @@ def mamba_split_conv1d_scan_ref(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, 
     if outproj_weight is not None:
         out = F.linear(out, outproj_weight, outproj_bias)
     return out
-

@@ -40,6 +40,7 @@ class Mamba2Simple(nn.Module):
         activation="swish",
         bias=False,
         conv_bias=True,
+        selective_read=True,
         # Fused kernel and sharding options
         chunk_size=256,
         use_mem_eff_path=True,
@@ -62,15 +63,16 @@ class Mamba2Simple(nn.Module):
         self.dt_limit = dt_limit
         self.learnable_init_states = learnable_init_states
         self.activation = activation
+        self.selective_read = selective_read
         self.chunk_size = chunk_size
         self.use_mem_eff_path = use_mem_eff_path
         self.layer_idx = layer_idx
 
-        # Order: [z, x, B, C, dt]
-        d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
+        # Order: [z, x, B, C, dt] or [z, x, B, dt] when using a static read projection.
+        d_in_proj = 2 * self.d_inner + self.ngroups * self.d_state * (2 if self.selective_read else 1) + self.nheads
         self.in_proj = nn.Linear(self.d_model, d_in_proj, bias=bias, **factory_kwargs)
 
-        conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
+        conv_dim = self.d_inner + self.ngroups * self.d_state * (2 if self.selective_read else 1)
         self.conv1d = nn.Conv1d(
             in_channels=conv_dim,
             out_channels=conv_dim,
@@ -87,6 +89,9 @@ class Mamba2Simple(nn.Module):
         if self.learnable_init_states:
             self.init_states = nn.Parameter(torch.zeros(self.nheads, self.headdim, self.d_state, **factory_kwargs))
             self.init_states._no_weight_decay = True
+        if not self.selective_read:
+            self.C = nn.Parameter(torch.empty(self.ngroups, self.d_state, **factory_kwargs))
+            nn.init.uniform_(self.C, -self.d_state**-0.5, self.d_state**-0.5)
 
         self.act = nn.SiLU()
 
@@ -153,12 +158,12 @@ class Mamba2Simple(nn.Module):
                 ngroups=self.ngroups,
                 norm_before_gate=False,
                 initial_states=initial_states,
+                static_C=self.C if not self.selective_read else None,
                 **dt_limit_kwargs,
             )
         else:
-            z, xBC, dt = torch.split(
-                zxbcdt, [self.d_inner, self.d_inner + 2 * self.ngroups * self.d_state, self.nheads], dim=-1
-            )
+            xBC_dim = self.d_inner + self.ngroups * self.d_state * (2 if self.selective_read else 1)
+            z, xBC, dt = torch.split(zxbcdt, [self.d_inner, xBC_dim, self.nheads], dim=-1)
             dt = F.softplus(dt + self.dt_bias)  # (B, L, nheads)
             assert self.activation in ["silu", "swish"]
 
@@ -176,15 +181,22 @@ class Mamba2Simple(nn.Module):
                     activation=self.activation,
                 ).transpose(1, 2)
 
-            # Split into 3 main branches: X, B, C
-            # These correspond to V, K, Q respectively in the SSM/attention duality
-            x, B, C = torch.split(xBC, [self.d_inner, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+            if self.selective_read:
+                # Split into 3 main branches: X, B, C.
+                # These correspond to V, K, Q respectively in the SSM/attention duality.
+                x, B, C = torch.split(
+                    xBC, [self.d_inner, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1
+                )
+                C = rearrange(C, "b l (g n) -> b l g n", g=self.ngroups)
+            else:
+                x, B = torch.split(xBC, [self.d_inner, self.ngroups * self.d_state], dim=-1)
+                C = repeat(self.C, "g n -> b l g n", b=batch, l=seqlen)
             y = mamba_chunk_scan_combined(
                 rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
                 dt,
                 A,
                 rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
-                rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
+                C,
                 chunk_size=self.chunk_size,
                 D=self.D,
                 z=None,
