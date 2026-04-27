@@ -1190,7 +1190,7 @@ def _mamba_chunk_scan_static_c_reduced_bwd(
         dout, x, dA_cumsum, prev_states, D=D, seq_idx=seq_idx
     )
     dstates, ddA_chunk_cumsum, dinitial_reduced, _ = _state_passing_bwd(
-        states,
+        prev_states,
         dA_cumsum[:, :, :, -1],
         dprev_states,
         seq_idx=seq_idx,
@@ -1203,8 +1203,11 @@ def _mamba_chunk_scan_static_c_reduced_bwd(
         alpha, x, dt, dA_cumsum, prefix_states, dout, dstates, seq_idx=seq_idx
     )
     dx = dx_state if dx_residual is None else dx_state + dx_residual
-    ddA = ddA_state + ddA_offdiag
-    ddA[..., -1] += ddA_chunk_cumsum
+    # The reduced kernels emit gradients wrt dA_cumsum positions; chunk_cumsum_bwd expects
+    # gradients wrt the per-token dA increments, so convert with a reverse cumsum.
+    ddA_offdiag[..., -1] += ddA_chunk_cumsum
+    ddA = ddA_state.flip([-1]).cumsum(dim=-1).flip([-1])
+    ddA += ddA_offdiag.flip([-1]).cumsum(dim=-1).flip([-1])
     alpha_heads = _alpha_heads_to_dt_layout(alpha, nheads=nheads, ngroups=ngroups, chunk_size=chunk_size).to(dbeta.dtype)
     ddt_direct = dbeta * alpha_heads
     dalpha_head = dbeta * dt.to(dtype=dbeta.dtype)
@@ -1415,9 +1418,7 @@ class MambaSplitConv1dScanCombinedStaticCFn(torch.autograd.Function):
         dzxbcdt = torch.empty_like(zxbcdt)
         dz_given, dxBC_given, ddt_given = torch.split(dzxbcdt, [dim, xBC_dim, nheads], dim=-1)
         dxBC = torch.empty_like(xBC)
-        dx, dB = torch.split(dxBC, [dim, ctx.ngroups * dstate], dim=-1)
-        dx = rearrange(dx, "b l (h p) -> b l h p", h=nheads)
-        dB = rearrange(dB, "b l (g n) -> b l g n", g=ctx.ngroups)
+        dx_flat, dB_flat = torch.split(dxBC, [dim, ctx.ngroups * dstate], dim=-1)
         if outproj_weight is not None:
             dout_og = dout
             dout = F.linear(dout, outproj_weight.t())
@@ -1490,6 +1491,8 @@ class MambaSplitConv1dScanCombinedStaticCFn(torch.autograd.Function):
             )
             dz_given.copy_(dz)
             ddt_given.copy_(ddt)
+        dx_flat.copy_(rearrange(dx, "b l h p -> b l (h p)"))
+        dB_flat.copy_(rearrange(dB, "b l g n -> b l (g n)"))
         if outproj_weight is not None:
             doutproj_weight = torch.einsum("bso,bsd->od", dout_og, out_for_linear)
             doutproj_bias = dout_og.sum(dim=(0, 1)) if outproj_bias is not None else None

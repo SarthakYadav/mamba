@@ -134,6 +134,29 @@ def _make_static_c_case(dtype):
     }
 
 
+_STATIC_C_GRAD_NAMES = ("zxbcdt", "conv1d_weight", "conv1d_bias", "dt_bias", "A", "D", "static_C")
+
+
+def _with_required_grads(kwargs):
+    return {
+        key: value.detach().clone().requires_grad_(key in _STATIC_C_GRAD_NAMES)
+        if isinstance(value, torch.Tensor)
+        else value
+        for key, value in kwargs.items()
+    }
+
+
+def _assert_static_c_grads_close(kwargs, kwargs_ref, *, atol=1e-2, rtol=1e-2):
+    for name in _STATIC_C_GRAD_NAMES:
+        grad = kwargs[name].grad
+        grad_ref = kwargs_ref[name].grad
+        assert grad is not None, f"missing grad for {name}"
+        assert grad_ref is not None, f"missing reference grad for {name}"
+        assert torch.isfinite(grad).all(), f"non-finite grad for {name}"
+        assert torch.isfinite(grad_ref).all(), f"non-finite reference grad for {name}"
+        assert torch.allclose(grad.float(), grad_ref.float(), atol=atol, rtol=rtol), f"{name} grad mismatch"
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_mamba2_simple_static_c_wrapper_seq_idx_matches_legacy(dtype):
     _require_fused_wrapper()
@@ -146,6 +169,30 @@ def test_mamba2_simple_static_c_wrapper_seq_idx_matches_legacy(dtype):
     out = mamba_split_conv1d_scan_combined(seq_idx=seq_idx, **kwargs)
     out_legacy = _mamba_split_conv1d_scan_static_c_legacy(seq_idx=seq_idx, **kwargs)
     assert torch.allclose(out.float(), out_legacy.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mamba2_simple_static_c_wrapper_seq_idx_backward_matches_legacy(dtype):
+    _require_fused_wrapper()
+    torch.manual_seed(5)
+
+    kwargs = _with_required_grads(_make_static_c_case(dtype))
+    kwargs_ref = _with_required_grads(kwargs)
+    seq_idx = torch.stack(
+        [
+            torch.tensor([0] * 10 + [1] * 12 + [2] * 10, device="cuda", dtype=torch.int32),
+            torch.tensor([3] * 16 + [4] * 16, device="cuda", dtype=torch.int32),
+        ]
+    )
+
+    out = mamba_split_conv1d_scan_combined(seq_idx=seq_idx, **kwargs)
+    out_ref = _mamba_split_conv1d_scan_static_c_legacy(seq_idx=seq_idx, **kwargs_ref)
+
+    out.float().square().mean().backward()
+    out_ref.float().square().mean().backward()
+
+    assert torch.allclose(out.float(), out_ref.float(), atol=1e-2, rtol=1e-2)
+    _assert_static_c_grads_close(kwargs, kwargs_ref)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -162,6 +209,33 @@ def test_mamba2_simple_static_c_wrapper_initial_states_matches_legacy(dtype):
     out = mamba_split_conv1d_scan_combined(initial_states=initial_states, **kwargs)
     out_legacy = _mamba_split_conv1d_scan_static_c_legacy(initial_states=initial_states, **kwargs)
     assert torch.allclose(out.float(), out_legacy.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mamba2_simple_static_c_wrapper_initial_states_backward_matches_legacy(dtype):
+    _require_fused_wrapper()
+    torch.manual_seed(6)
+
+    kwargs = _with_required_grads(_make_static_c_case(dtype))
+    kwargs_ref = _with_required_grads(kwargs)
+    batch = kwargs["zxbcdt"].shape[0]
+    nheads = kwargs["D"].shape[0]
+    headdim = kwargs["headdim"]
+    dstate = kwargs["static_C"].shape[-1]
+    initial_states = (torch.randn(batch, nheads, headdim, dstate, device="cuda", dtype=dtype) / 5).requires_grad_()
+    initial_states_ref = initial_states.detach().clone().requires_grad_(True)
+
+    out = mamba_split_conv1d_scan_combined(initial_states=initial_states, **kwargs)
+    out_ref = _mamba_split_conv1d_scan_static_c_legacy(initial_states=initial_states_ref, **kwargs_ref)
+
+    out.float().square().mean().backward()
+    out_ref.float().square().mean().backward()
+
+    assert torch.allclose(out.float(), out_ref.float(), atol=1e-2, rtol=1e-2)
+    _assert_static_c_grads_close(kwargs, kwargs_ref)
+    assert initial_states.grad is not None
+    assert initial_states_ref.grad is not None
+    assert torch.allclose(initial_states.grad.float(), initial_states_ref.grad.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -183,15 +257,8 @@ def test_mamba2_simple_static_c_wrapper_final_states_backward_matches_legacy(dty
     _require_fused_wrapper()
     torch.manual_seed(4)
 
-    kwargs = _make_static_c_case(dtype)
-    for name in ["zxbcdt", "conv1d_weight", "conv1d_bias", "dt_bias", "A", "D", "static_C"]:
-        kwargs[name] = kwargs[name].detach().clone().requires_grad_(True)
-    kwargs_ref = {
-        key: value.detach().clone().requires_grad_(value.requires_grad)
-        if isinstance(value, torch.Tensor)
-        else value
-        for key, value in kwargs.items()
-    }
+    kwargs = _with_required_grads(_make_static_c_case(dtype))
+    kwargs_ref = _with_required_grads(kwargs)
 
     out, final_states = mamba_split_conv1d_scan_combined(return_final_states=True, **kwargs)
     out_ref, final_states_ref = _mamba_split_conv1d_scan_static_c_legacy(
@@ -203,16 +270,4 @@ def test_mamba2_simple_static_c_wrapper_final_states_backward_matches_legacy(dty
     loss.backward()
     loss_ref.backward()
 
-    grads = [
-        ("zxbcdt", kwargs["zxbcdt"].grad, kwargs_ref["zxbcdt"].grad),
-        ("conv1d_weight", kwargs["conv1d_weight"].grad, kwargs_ref["conv1d_weight"].grad),
-        ("conv1d_bias", kwargs["conv1d_bias"].grad, kwargs_ref["conv1d_bias"].grad),
-        ("dt_bias", kwargs["dt_bias"].grad, kwargs_ref["dt_bias"].grad),
-        ("A", kwargs["A"].grad, kwargs_ref["A"].grad),
-        ("D", kwargs["D"].grad, kwargs_ref["D"].grad),
-        ("static_C", kwargs["static_C"].grad, kwargs_ref["static_C"].grad),
-    ]
-    for name, grad, grad_ref in grads:
-        assert grad is not None, f"missing grad for {name}"
-        assert grad_ref is not None, f"missing reference grad for {name}"
-        assert torch.allclose(grad.float(), grad_ref.float(), atol=1e-2, rtol=1e-2), f"{name} grad mismatch"
+    _assert_static_c_grads_close(kwargs, kwargs_ref)

@@ -151,10 +151,12 @@ def test_mamba2_simple_selective_read_false_fused_matches_nonfused(dtype):
     y_ref.float().square().mean().backward()
 
     assert torch.allclose(x.grad.float(), x_ref.grad.float(), atol=1e-2, rtol=1e-2)
-    assert torch.allclose(model.C.grad.float(), model_ref.C.grad.float(), atol=1e-2, rtol=1e-2)
-    assert torch.allclose(
-        model.dt_bias.grad.float(), model_ref.dt_bias.grad.float(), atol=1e-2, rtol=1e-2
-    )
-    assert torch.allclose(
-        model.A_log.grad.float(), model_ref.A_log.grad.float(), atol=1e-2, rtol=1e-2
-    )
+    ref_params = dict(model_ref.named_parameters())
+    for name, param in model.named_parameters():
+        grad = param.grad
+        grad_ref = ref_params[name].grad
+        assert grad is not None, f"missing grad for {name}"
+        assert grad_ref is not None, f"missing reference grad for {name}"
+        assert torch.isfinite(grad).all(), f"non-finite grad for {name}"
+        assert torch.isfinite(grad_ref).all(), f"non-finite reference grad for {name}"
+        assert torch.allclose(grad.float(), grad_ref.float(), atol=1e-2, rtol=1e-2), f"{name} grad mismatch"
