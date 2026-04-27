@@ -801,8 +801,15 @@ def mamba_conv1d_scan_ref(xBC, conv1d_weight, conv1d_bias, dt, A, chunk_size, D=
         else:
             headdim = D.shape[1]
         dim = nheads * headdim
-    xBC = rearrange(causal_conv1d_fn(rearrange(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias, activation=activation),
-                    "b d s -> b s d")
+    xBC = rearrange(
+        causal_conv1d_fn(
+            rearrange(ensure_stride(xBC), "b s d -> b d s"),
+            conv1d_weight,
+            conv1d_bias,
+            activation=activation,
+        ),
+        "b d s -> b s d",
+    )
     dstate = (xBC.shape[-1] - dim) // ngroups // 2
     x, B, C = torch.split(xBC, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
     x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
@@ -1079,8 +1086,15 @@ def mamba_split_conv1d_scan_ref(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, 
     if rmsnorm_weight is not None:
         assert rmsnorm_weight.shape == (dim,)
     z, xBC, dt = torch.split(zxbcdt, [dim, xBC_dim, nheads], dim=-1)
-    xBC = rearrange(causal_conv1d_fn(rearrange(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias, activation=activation),
-                    "b d s -> b s d")
+    xBC = rearrange(
+        causal_conv1d_fn(
+            rearrange(ensure_stride(xBC), "b s d -> b d s"),
+            conv1d_weight,
+            conv1d_bias,
+            activation=activation,
+        ),
+        "b d s -> b s d",
+    )
     if has_static_C:
         x, B = torch.split(xBC, [dim, ngroups * dstate], dim=-1)
         C = _repeat_static_c(static_C, batch, seqlen)
