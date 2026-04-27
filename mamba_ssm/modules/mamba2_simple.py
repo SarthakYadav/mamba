@@ -19,6 +19,7 @@ except ImportError:
 
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
+from mamba_ssm.ops.triton.ssd_combined import ensure_stride
 
 
 class Mamba2Simple(nn.Module):
@@ -175,7 +176,7 @@ class Mamba2Simple(nn.Module):
                 xBC = xBC[:, :seqlen, :]
             else:
                 xBC = causal_conv1d_fn(
-                    x=xBC.transpose(1, 2),
+                    x=ensure_stride(xBC).transpose(1, 2),
                     weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
                     bias=self.conv1d.bias,
                     activation=self.activation,
