@@ -759,7 +759,7 @@ def ssd_selective_scan(x, dt, A, B, C, D=None, z=None, dt_bias=None, dt_softplus
     if dt_bias is not None:
         if dt_bias.dim() == 1:
             dt_bias = repeat(dt_bias, "h -> h p", p=headdim)
-        dt_bias = rearrange(dt_bias, "h p -> (h p)")
+        dt_bias = rearrange(dt_bias, "h p -> (h p)").to(dtype=torch.float32)
     if dt_limit != (0.0, float("inf")):
         if dt_bias is not None:
             dt = dt + rearrange(dt_bias, "d -> d 1")
