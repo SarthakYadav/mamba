@@ -3,6 +3,7 @@ import torch
 
 from mamba_ssm.ops.triton import ssd_combined
 from mamba_ssm.ops.triton.ssd_combined import (
+    _mamba_split_conv1d_scan_static_c_legacy,
     mamba_split_conv1d_scan_combined,
     mamba_split_conv1d_scan_ref,
 )
@@ -134,7 +135,7 @@ def _make_static_c_case(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_mamba2_simple_static_c_wrapper_seq_idx_falls_back_to_legacy(dtype):
+def test_mamba2_simple_static_c_wrapper_seq_idx_matches_legacy(dtype):
     _require_fused_wrapper()
     torch.manual_seed(1)
 
@@ -142,13 +143,13 @@ def test_mamba2_simple_static_c_wrapper_seq_idx_falls_back_to_legacy(dtype):
     seq_idx = torch.arange(kwargs["zxbcdt"].shape[1], device="cuda", dtype=torch.int32).expand(
         kwargs["zxbcdt"].shape[0], -1
     )
-    out = mamba_split_conv1d_scan_combined(seq_idx=seq_idx, _static_c_impl="auto", **kwargs)
-    out_legacy = mamba_split_conv1d_scan_combined(seq_idx=seq_idx, _static_c_impl="legacy_ssd", **kwargs)
+    out = mamba_split_conv1d_scan_combined(seq_idx=seq_idx, **kwargs)
+    out_legacy = _mamba_split_conv1d_scan_static_c_legacy(seq_idx=seq_idx, **kwargs)
     assert torch.allclose(out.float(), out_legacy.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_mamba2_simple_static_c_wrapper_initial_states_falls_back_to_legacy(dtype):
+def test_mamba2_simple_static_c_wrapper_initial_states_matches_legacy(dtype):
     _require_fused_wrapper()
     torch.manual_seed(2)
 
@@ -158,24 +159,60 @@ def test_mamba2_simple_static_c_wrapper_initial_states_falls_back_to_legacy(dtyp
     headdim = kwargs["headdim"]
     dstate = kwargs["static_C"].shape[-1]
     initial_states = torch.randn(batch, nheads, headdim, dstate, device="cuda", dtype=dtype) / 5
-    out = mamba_split_conv1d_scan_combined(initial_states=initial_states, _static_c_impl="auto", **kwargs)
-    out_legacy = mamba_split_conv1d_scan_combined(
-        initial_states=initial_states, _static_c_impl="legacy_ssd", **kwargs
-    )
+    out = mamba_split_conv1d_scan_combined(initial_states=initial_states, **kwargs)
+    out_legacy = _mamba_split_conv1d_scan_static_c_legacy(initial_states=initial_states, **kwargs)
     assert torch.allclose(out.float(), out_legacy.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_mamba2_simple_static_c_wrapper_return_final_states_falls_back_to_legacy(dtype):
+def test_mamba2_simple_static_c_wrapper_return_final_states_matches_legacy(dtype):
     _require_fused_wrapper()
     torch.manual_seed(3)
 
     kwargs = _make_static_c_case(dtype)
-    out, final_states = mamba_split_conv1d_scan_combined(
-        return_final_states=True, _static_c_impl="auto", **kwargs
-    )
-    out_legacy, final_states_legacy = mamba_split_conv1d_scan_combined(
-        return_final_states=True, _static_c_impl="legacy_ssd", **kwargs
+    out, final_states = mamba_split_conv1d_scan_combined(return_final_states=True, **kwargs)
+    out_legacy, final_states_legacy = _mamba_split_conv1d_scan_static_c_legacy(
+        return_final_states=True, **kwargs
     )
     assert torch.allclose(out.float(), out_legacy.float(), atol=1e-2, rtol=1e-2)
     assert torch.allclose(final_states.float(), final_states_legacy.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mamba2_simple_static_c_wrapper_final_states_backward_matches_legacy(dtype):
+    _require_fused_wrapper()
+    torch.manual_seed(4)
+
+    kwargs = _make_static_c_case(dtype)
+    for name in ["zxbcdt", "conv1d_weight", "conv1d_bias", "dt_bias", "A", "D", "static_C"]:
+        kwargs[name] = kwargs[name].detach().clone().requires_grad_(True)
+    kwargs_ref = {
+        key: value.detach().clone().requires_grad_(value.requires_grad)
+        if isinstance(value, torch.Tensor)
+        else value
+        for key, value in kwargs.items()
+    }
+
+    out, final_states = mamba_split_conv1d_scan_combined(return_final_states=True, **kwargs)
+    out_ref, final_states_ref = _mamba_split_conv1d_scan_static_c_legacy(
+        return_final_states=True, **kwargs_ref
+    )
+
+    loss = out.float().square().mean() + final_states.float().square().mean()
+    loss_ref = out_ref.float().square().mean() + final_states_ref.float().square().mean()
+    loss.backward()
+    loss_ref.backward()
+
+    grads = [
+        ("zxbcdt", kwargs["zxbcdt"].grad, kwargs_ref["zxbcdt"].grad),
+        ("conv1d_weight", kwargs["conv1d_weight"].grad, kwargs_ref["conv1d_weight"].grad),
+        ("conv1d_bias", kwargs["conv1d_bias"].grad, kwargs_ref["conv1d_bias"].grad),
+        ("dt_bias", kwargs["dt_bias"].grad, kwargs_ref["dt_bias"].grad),
+        ("A", kwargs["A"].grad, kwargs_ref["A"].grad),
+        ("D", kwargs["D"].grad, kwargs_ref["D"].grad),
+        ("static_C", kwargs["static_C"].grad, kwargs_ref["static_C"].grad),
+    ]
+    for name, grad, grad_ref in grads:
+        assert grad is not None, f"missing grad for {name}"
+        assert grad_ref is not None, f"missing reference grad for {name}"
+        assert torch.allclose(grad.float(), grad_ref.float(), atol=1e-2, rtol=1e-2), f"{name} grad mismatch"

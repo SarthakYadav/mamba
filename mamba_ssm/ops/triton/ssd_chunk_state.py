@@ -1120,3 +1120,300 @@ def chunk_state_ref(B, x, dt, dA_cumsum):
     B = rearrange(B, "b (c l) ... -> b c l ...", l=chunk_size)
     decay_states = torch.exp((dA_cumsum[:, :, :, -1:] - dA_cumsum))
     return torch.einsum("bclhn,bhcl,bhcl,bclhp->bchpn", B.to(x.dtype), decay_states.to(x.dtype), dt.to(x.dtype), x)
+
+
+@triton.autotune(
+    configs=autotune_configs([
+        triton.Config({"BLOCK_SIZE_N": 32}, num_warps=2),
+        triton.Config({"BLOCK_SIZE_N": 64}, num_warps=4),
+        triton.Config({"BLOCK_SIZE_N": 128}, num_warps=4),
+    ]),
+    key=["chunk_size", "hdim"],
+)
+@triton.jit
+def _reduced_chunk_state_fwd_kernel(
+    x_ptr, alpha_ptr, prefix_ptr, states_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr,
+    hdim, chunk_size,
+    batch, seqlen, nheads_ngroups_ratio,
+    stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_hdim,
+    stride_alpha_batch, stride_alpha_seqlen, stride_alpha_group,
+    stride_prefix_batch, stride_prefix_seqlen, stride_prefix_head, stride_prefix_hdim,
+    stride_states_batch, stride_states_chunk, stride_states_head, stride_states_hdim,
+    stride_dt_batch, stride_dt_chunk, stride_dt_head, stride_dt_csize,
+    stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head, stride_dA_cs_csize,
+    stride_seq_idx_batch, stride_seq_idx_seqlen,
+    HAS_SEQ_IDX: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_CHUNK: tl.constexpr,
+):
+    pid_bc = tl.program_id(axis=1)
+    pid_c = pid_bc // batch
+    pid_b = pid_bc - pid_c * batch
+    pid_h = tl.program_id(axis=2)
+    pid_n = tl.program_id(axis=0)
+
+    x_ptr += pid_b * stride_x_batch + pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head
+    alpha_ptr += pid_b * stride_alpha_batch + pid_c * chunk_size * stride_alpha_seqlen + (pid_h // nheads_ngroups_ratio) * stride_alpha_group
+    prefix_ptr += pid_b * stride_prefix_batch + pid_c * chunk_size * stride_prefix_seqlen + pid_h * stride_prefix_head
+    states_ptr += pid_b * stride_states_batch + pid_c * stride_states_chunk + pid_h * stride_states_head
+    dt_ptr += pid_b * stride_dt_batch + pid_c * stride_dt_chunk + pid_h * stride_dt_head
+    dA_cumsum_ptr += pid_b * stride_dA_cs_batch + pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
+    if HAS_SEQ_IDX:
+        seq_idx_ptr += pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
+
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+
+    q = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
+    dA_prev = 0.0
+    seq_prev = tl.full((), -1, tl.int32)
+    for m in range(0, BLOCK_SIZE_CHUNK):
+        if m < chunk_size_limit:
+            dA_cur = tl.load(dA_cumsum_ptr + m * stride_dA_cs_csize).to(tl.float32)
+            alpha = tl.load(alpha_ptr + m * stride_alpha_seqlen).to(tl.float32)
+            dt = tl.load(dt_ptr + m * stride_dt_csize).to(tl.float32)
+            x = tl.load(
+                x_ptr + m * stride_x_seqlen + offs_n * stride_x_hdim,
+                mask=offs_n < hdim,
+                other=0.0,
+            ).to(tl.float32)
+            if m == 0:
+                scale = 0.0
+            else:
+                if HAS_SEQ_IDX:
+                    seq_cur = tl.load(seq_idx_ptr + m * stride_seq_idx_seqlen)
+                    same_seq = seq_cur == seq_prev
+                else:
+                    same_seq = True
+                scale = tl.where(
+                    same_seq,
+                    tl.exp(tl.minimum(dA_cur - dA_prev, 0.0)),
+                    0.0,
+                )
+            q = q * scale + x * (alpha * dt)
+            tl.store(
+                prefix_ptr + m * stride_prefix_seqlen + offs_n * stride_prefix_hdim,
+                q,
+                mask=offs_n < hdim,
+            )
+            dA_prev = dA_cur
+            if HAS_SEQ_IDX:
+                seq_prev = tl.load(seq_idx_ptr + m * stride_seq_idx_seqlen)
+
+    tl.store(states_ptr + offs_n * stride_states_hdim, q, mask=offs_n < hdim)
+
+
+_REDUCED_CHUNK_STATE_BWD_MIN_BLOCK_N = 32
+
+
+@triton.autotune(
+    configs=autotune_configs([
+        triton.Config({"BLOCK_SIZE_N": 32}, num_warps=2, pre_hook=init_to_zero(["dbeta_ptr", "ddA_ptr"])),
+        triton.Config({"BLOCK_SIZE_N": 64}, num_warps=4, pre_hook=init_to_zero(["dbeta_ptr", "ddA_ptr"])),
+        triton.Config({"BLOCK_SIZE_N": 128}, num_warps=4, pre_hook=init_to_zero(["dbeta_ptr", "ddA_ptr"])),
+    ]),
+    key=["chunk_size", "hdim"],
+)
+@triton.jit
+def _reduced_chunk_state_bwd_kernel(
+    x_ptr, alpha_ptr, prefix_ptr, dprefix_ptr, dstates_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr,
+    dx_ptr, dbeta_ptr, ddA_ptr,
+    hdim, chunk_size,
+    batch, seqlen, nheads_ngroups_ratio,
+    stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_hdim,
+    stride_alpha_batch, stride_alpha_seqlen, stride_alpha_group,
+    stride_prefix_batch, stride_prefix_seqlen, stride_prefix_head, stride_prefix_hdim,
+    stride_dprefix_batch, stride_dprefix_seqlen, stride_dprefix_head, stride_dprefix_hdim,
+    stride_dstates_batch, stride_dstates_chunk, stride_dstates_head, stride_dstates_hdim,
+    stride_dt_batch, stride_dt_chunk, stride_dt_head, stride_dt_csize,
+    stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head, stride_dA_cs_csize,
+    stride_seq_idx_batch, stride_seq_idx_seqlen,
+    stride_dx_batch, stride_dx_seqlen, stride_dx_head, stride_dx_hdim,
+    stride_dbeta_batch, stride_dbeta_head, stride_dbeta_chunk, stride_dbeta_csize, stride_dbeta_tile,
+    stride_ddA_batch, stride_ddA_head, stride_ddA_chunk, stride_ddA_csize, stride_ddA_tile,
+    HAS_SEQ_IDX: tl.constexpr,
+    DETERMINISTIC_REDUCTION: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_CHUNK: tl.constexpr,
+):
+    pid_bc = tl.program_id(axis=1)
+    pid_c = pid_bc // batch
+    pid_b = pid_bc - pid_c * batch
+    pid_h = tl.program_id(axis=2)
+    pid_n = tl.program_id(axis=0)
+
+    x_ptr += pid_b * stride_x_batch + pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head
+    alpha_ptr += pid_b * stride_alpha_batch + pid_c * chunk_size * stride_alpha_seqlen + (pid_h // nheads_ngroups_ratio) * stride_alpha_group
+    prefix_ptr += pid_b * stride_prefix_batch + pid_c * chunk_size * stride_prefix_seqlen + pid_h * stride_prefix_head
+    dprefix_ptr += pid_b * stride_dprefix_batch + pid_c * chunk_size * stride_dprefix_seqlen + pid_h * stride_dprefix_head
+    dstates_ptr += pid_b * stride_dstates_batch + pid_c * stride_dstates_chunk + pid_h * stride_dstates_head
+    dt_ptr += pid_b * stride_dt_batch + pid_c * stride_dt_chunk + pid_h * stride_dt_head
+    dA_cumsum_ptr += pid_b * stride_dA_cs_batch + pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
+    dx_ptr += pid_b * stride_dx_batch + pid_c * chunk_size * stride_dx_seqlen + pid_h * stride_dx_head
+    dbeta_ptr += pid_b * stride_dbeta_batch + pid_h * stride_dbeta_head + pid_c * stride_dbeta_chunk
+    ddA_ptr += pid_b * stride_ddA_batch + pid_h * stride_ddA_head + pid_c * stride_ddA_chunk
+    if HAS_SEQ_IDX:
+        seq_idx_ptr += pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
+
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
+
+    g_next = tl.load(dstates_ptr + offs_n * stride_dstates_hdim, mask=offs_n < hdim, other=0.0).to(tl.float32)
+    next_ddelta = 0.0
+    for i in range(0, BLOCK_SIZE_CHUNK):
+        m = BLOCK_SIZE_CHUNK - 1 - i
+        if m < chunk_size_limit:
+            x = tl.load(
+                x_ptr + m * stride_x_seqlen + offs_n * stride_x_hdim,
+                mask=offs_n < hdim,
+                other=0.0,
+            ).to(tl.float32)
+            q = tl.load(
+                prefix_ptr + m * stride_prefix_seqlen + offs_n * stride_prefix_hdim,
+                mask=offs_n < hdim,
+                other=0.0,
+            ).to(tl.float32)
+            dprefix = tl.load(
+                dprefix_ptr + m * stride_dprefix_seqlen + offs_n * stride_dprefix_hdim,
+                mask=offs_n < hdim,
+                other=0.0,
+            ).to(tl.float32)
+            alpha = tl.load(alpha_ptr + m * stride_alpha_seqlen).to(tl.float32)
+            dt = tl.load(dt_ptr + m * stride_dt_csize).to(tl.float32)
+            beta = alpha * dt
+            g = g_next + dprefix
+
+            if m > 0:
+                dA_cur = tl.load(dA_cumsum_ptr + m * stride_dA_cs_csize).to(tl.float32)
+                dA_prev = tl.load(dA_cumsum_ptr + (m - 1) * stride_dA_cs_csize).to(tl.float32)
+                if HAS_SEQ_IDX:
+                    seq_cur = tl.load(seq_idx_ptr + m * stride_seq_idx_seqlen)
+                    seq_prev = tl.load(seq_idx_ptr + (m - 1) * stride_seq_idx_seqlen)
+                    same_seq = seq_cur == seq_prev
+                else:
+                    same_seq = True
+                scale = tl.where(
+                    same_seq,
+                    tl.exp(tl.minimum(dA_cur - dA_prev, 0.0)),
+                    0.0,
+                )
+                prev_contrib = tl.where(same_seq, q - x * beta, 0.0)
+            else:
+                scale = 0.0
+                prev_contrib = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
+
+            dx = g * beta
+            tl.store(dx_ptr + m * stride_dx_seqlen + offs_n * stride_dx_hdim, dx, mask=offs_n < hdim)
+
+            dbeta = tl.sum(g * x, axis=0)
+            ddelta = tl.sum(g * prev_contrib, axis=0)
+            ddA = ddelta - next_ddelta
+            next_ddelta = ddelta
+
+            dbeta_ptr_m = dbeta_ptr + m * stride_dbeta_csize
+            ddA_ptr_m = ddA_ptr + m * stride_ddA_csize
+            if DETERMINISTIC_REDUCTION:
+                tl.store(dbeta_ptr_m + pid_n * stride_dbeta_tile, dbeta)
+                tl.store(ddA_ptr_m + pid_n * stride_ddA_tile, ddA)
+            else:
+                tl.atomic_add(dbeta_ptr_m, dbeta)
+                tl.atomic_add(ddA_ptr_m, ddA)
+
+            g_next = g * scale
+
+
+def _reduced_chunk_state_fwd(alpha, x, dt, dA_cumsum, seq_idx=None, prefix_states=None, states=None, states_in_fp32=True):
+    batch, seqlen, nheads, headdim = x.shape
+    _, _, nchunks, chunk_size = dt.shape
+    _, _, ngroups = alpha.shape
+    assert nheads % ngroups == 0
+    assert alpha.shape == (batch, seqlen, ngroups)
+    assert dt.shape == (batch, nheads, nchunks, chunk_size)
+    assert dA_cumsum.shape == dt.shape
+    if seq_idx is not None:
+        assert seq_idx.shape == (batch, seqlen)
+    if prefix_states is None:
+        prefix_states = torch.empty_like(x)
+    else:
+        assert prefix_states.shape == x.shape
+    if states is None:
+        states_dtype = torch.float32 if states_in_fp32 else x.dtype
+        states = torch.empty((batch, nchunks, nheads, headdim), device=x.device, dtype=states_dtype)
+    else:
+        assert states.shape == (batch, nchunks, nheads, headdim)
+    grid = lambda META: (triton.cdiv(headdim, META["BLOCK_SIZE_N"]), batch * nchunks, nheads)
+    with torch.cuda.device(x.device.index):
+        _reduced_chunk_state_fwd_kernel[grid](
+            x, alpha, prefix_states, states, dt, dA_cumsum, seq_idx,
+            headdim, chunk_size,
+            batch, seqlen, nheads // ngroups,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            alpha.stride(0), alpha.stride(1), alpha.stride(2),
+            prefix_states.stride(0), prefix_states.stride(1), prefix_states.stride(2), prefix_states.stride(3),
+            states.stride(0), states.stride(1), states.stride(2), states.stride(3),
+            dt.stride(0), dt.stride(2), dt.stride(1), dt.stride(3),
+            dA_cumsum.stride(0), dA_cumsum.stride(2), dA_cumsum.stride(1), dA_cumsum.stride(3),
+            *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
+            HAS_SEQ_IDX=seq_idx is not None,
+            BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
+        )
+    return prefix_states, states
+
+
+def _reduced_chunk_state_bwd(alpha, x, dt, dA_cumsum, prefix_states, dprefix, dstates, seq_idx=None):
+    batch, seqlen, nheads, headdim = x.shape
+    _, _, nchunks, chunk_size = dt.shape
+    _, _, ngroups = alpha.shape
+    assert nheads % ngroups == 0
+    assert alpha.shape == (batch, seqlen, ngroups)
+    assert dt.shape == (batch, nheads, nchunks, chunk_size)
+    assert dA_cumsum.shape == dt.shape
+    assert prefix_states.shape == x.shape
+    assert dprefix.shape == x.shape
+    assert dstates.shape == (batch, nchunks, nheads, headdim)
+    if seq_idx is not None:
+        assert seq_idx.shape == (batch, seqlen)
+    dx = torch.empty_like(x)
+    deterministic = use_deterministic_mode()
+    tile_count = math.ceil(headdim / _REDUCED_CHUNK_STATE_BWD_MIN_BLOCK_N)
+    dbeta, stride_dbeta_tile = alloc_tile_workspace(
+        (batch, nheads, nchunks, chunk_size),
+        tile_count,
+        torch.float32,
+        x.device,
+        deterministic,
+        zero_init=True,
+    )
+    ddA, stride_ddA_tile = alloc_tile_workspace(
+        (batch, nheads, nchunks, chunk_size),
+        tile_count,
+        torch.float32,
+        x.device,
+        deterministic,
+        zero_init=True,
+    )
+    grid = lambda META: (triton.cdiv(headdim, META["BLOCK_SIZE_N"]), batch * nchunks, nheads)
+    with torch.cuda.device(x.device.index):
+        _reduced_chunk_state_bwd_kernel[grid](
+            x, alpha, prefix_states, dprefix, dstates, dt, dA_cumsum, seq_idx,
+            dx, dbeta, ddA,
+            headdim, chunk_size,
+            batch, seqlen, nheads // ngroups,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            alpha.stride(0), alpha.stride(1), alpha.stride(2),
+            prefix_states.stride(0), prefix_states.stride(1), prefix_states.stride(2), prefix_states.stride(3),
+            dprefix.stride(0), dprefix.stride(1), dprefix.stride(2), dprefix.stride(3),
+            dstates.stride(0), dstates.stride(1), dstates.stride(2), dstates.stride(3),
+            dt.stride(0), dt.stride(2), dt.stride(1), dt.stride(3),
+            dA_cumsum.stride(0), dA_cumsum.stride(2), dA_cumsum.stride(1), dA_cumsum.stride(3),
+            *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
+            dx.stride(0), dx.stride(1), dx.stride(2), dx.stride(3),
+            dbeta.stride(0), dbeta.stride(1), dbeta.stride(2), dbeta.stride(3), stride_dbeta_tile,
+            ddA.stride(0), ddA.stride(1), ddA.stride(2), ddA.stride(3), stride_ddA_tile,
+            HAS_SEQ_IDX=seq_idx is not None,
+            DETERMINISTIC_REDUCTION=deterministic,
+            BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
+        )
+    dbeta = finalize_tile_workspace(dbeta, deterministic)
+    ddA = finalize_tile_workspace(ddA, deterministic)
+    return dx, dbeta, ddA

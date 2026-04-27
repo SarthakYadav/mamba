@@ -108,12 +108,12 @@ def test_mamba2_simple_selective_read_false_fused_forward_backward(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_mamba2_simple_selective_read_false_collapsed_matches_legacy_fused(dtype):
+def test_mamba2_simple_selective_read_false_fused_matches_nonfused(dtype):
     _require_fused_path()
     torch.manual_seed(2)
 
     batch, seqlen, d_model = 2, 64, 64
-    model_legacy = Mamba2Simple(
+    model_ref = Mamba2Simple(
         d_model=d_model,
         d_state=8,
         d_conv=4,
@@ -125,7 +125,7 @@ def test_mamba2_simple_selective_read_false_collapsed_matches_legacy_fused(dtype
         device="cuda",
         dtype=dtype,
     )
-    model_collapsed = Mamba2Simple(
+    model = Mamba2Simple(
         d_model=d_model,
         d_state=8,
         d_conv=4,
@@ -137,16 +137,13 @@ def test_mamba2_simple_selective_read_false_collapsed_matches_legacy_fused(dtype
         device="cuda",
         dtype=dtype,
     )
-    model_collapsed.load_state_dict(model_legacy.state_dict())
-    model_legacy.use_mem_eff_path = True
-    model_legacy._static_c_impl = "legacy_ssd"
-    model_collapsed._static_c_impl = "collapsed"
+    model.load_state_dict(model_ref.state_dict())
 
     x = torch.randn(batch, seqlen, d_model, device="cuda", dtype=dtype, requires_grad=True)
     x_ref = x.detach().clone().requires_grad_(True)
 
-    y = model_collapsed(x)
-    y_ref = model_legacy(x_ref)
+    y = model(x)
+    y_ref = model_ref(x_ref)
 
     assert torch.allclose(y.float(), y_ref.float(), atol=1e-2, rtol=1e-2)
 
@@ -154,10 +151,10 @@ def test_mamba2_simple_selective_read_false_collapsed_matches_legacy_fused(dtype
     y_ref.float().square().mean().backward()
 
     assert torch.allclose(x.grad.float(), x_ref.grad.float(), atol=1e-2, rtol=1e-2)
-    assert torch.allclose(model_collapsed.C.grad.float(), model_legacy.C.grad.float(), atol=1e-2, rtol=1e-2)
+    assert torch.allclose(model.C.grad.float(), model_ref.C.grad.float(), atol=1e-2, rtol=1e-2)
     assert torch.allclose(
-        model_collapsed.dt_bias.grad.float(), model_legacy.dt_bias.grad.float(), atol=1e-2, rtol=1e-2
+        model.dt_bias.grad.float(), model_ref.dt_bias.grad.float(), atol=1e-2, rtol=1e-2
     )
     assert torch.allclose(
-        model_collapsed.A_log.grad.float(), model_legacy.A_log.grad.float(), atol=1e-2, rtol=1e-2
+        model.A_log.grad.float(), model_ref.A_log.grad.float(), atol=1e-2, rtol=1e-2
     )

@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Callable
 
 import torch
+from einops import rearrange, repeat
 
 try:
     from triton.testing import do_bench
@@ -14,6 +15,7 @@ except ImportError:
 
 from mamba_ssm.modules.mamba_simple import Mamba
 from mamba_ssm.modules.mamba2_simple import Mamba2Simple
+from mamba_ssm.ops.triton.ssd_combined import _mamba_split_conv1d_scan_static_c_legacy
 
 
 FAMILY_DISPLAY = {
@@ -102,7 +104,6 @@ def make_model(
     headdim: int,
     ngroups: int,
     selective_read: bool,
-    static_c_impl: str | None,
     device: str,
     dtype: torch.dtype,
 ) -> torch.nn.Module:
@@ -118,7 +119,7 @@ def make_model(
             dtype=dtype,
         )
     if family == "mamba2_simple":
-        model = Mamba2Simple(
+        return Mamba2Simple(
             d_model=d_model,
             d_state=d_state,
             d_conv=d_conv,
@@ -130,8 +131,6 @@ def make_model(
             device=device,
             dtype=dtype,
         )
-        model._static_c_impl = "auto" if static_c_impl is None else static_c_impl
-        return model
     raise ValueError(f"Unsupported family: {family}")
 
 
@@ -143,7 +142,6 @@ def run_case(
     *,
     family: str,
     selective_read: bool,
-    static_c_impl: str | None,
     benchmark_group: str,
     pass_name: str,
     batch: int,
@@ -168,7 +166,6 @@ def run_case(
         headdim=headdim,
         ngroups=ngroups,
         selective_read=selective_read,
-        static_c_impl=static_c_impl,
         device=device,
         dtype=dtype,
     )
@@ -203,7 +200,120 @@ def run_case(
         ms=ms,
         toks_per_sec=toks_per_sec,
         benchmark_group=benchmark_group,
-        static_c_impl=static_c_impl,
+    )
+
+
+def _run_legacy_static_c_mamba2_simple(model: Mamba2Simple, x: torch.Tensor) -> torch.Tensor:
+    zxbcdt = model.in_proj(x)
+    A = -torch.exp(model.A_log)
+    initial_states = (
+        repeat(model.init_states, "... -> b ...", b=x.shape[0]) if model.learnable_init_states else None
+    )
+    return _mamba_split_conv1d_scan_static_c_legacy(
+        zxbcdt,
+        rearrange(model.conv1d.weight, "d 1 w -> d w"),
+        model.conv1d.bias,
+        model.dt_bias,
+        A,
+        model.D,
+        chunk_size=model.chunk_size,
+        initial_states=initial_states,
+        seq_idx=None,
+        dt_limit=model.dt_limit,
+        return_final_states=False,
+        activation=model.activation,
+        rmsnorm_weight=model.norm.weight,
+        rmsnorm_eps=model.norm.eps,
+        outproj_weight=model.out_proj.weight,
+        outproj_bias=model.out_proj.bias,
+        headdim=model.headdim,
+        ngroups=model.ngroups,
+        norm_before_gate=False,
+        static_C=model.C,
+    )
+
+
+def run_static_c_baseline_case(
+    *,
+    impl: str,
+    pass_name: str,
+    batch: int,
+    seqlen: int,
+    d_model: int,
+    d_state: int,
+    d_conv: int,
+    expand: int,
+    headdim: int,
+    ngroups: int,
+    device: str,
+    dtype: torch.dtype,
+    warmup: int,
+    rep: int,
+) -> BenchmarkResult:
+    model = make_model(
+        "mamba2_simple",
+        d_model=d_model,
+        d_state=d_state,
+        d_conv=d_conv,
+        expand=expand,
+        headdim=headdim,
+        ngroups=ngroups,
+        selective_read=False,
+        device=device,
+        dtype=dtype,
+    )
+    x_data = make_input(batch=batch, seqlen=seqlen, d_model=d_model, device=device, dtype=dtype)
+
+    if impl == "reduced":
+        if pass_name == "forward":
+            model.eval()
+
+            @torch.inference_mode()
+            def fn() -> None:
+                model(x_data)
+        elif pass_name == "forward_backward":
+            model.train()
+
+            def fn() -> None:
+                model.zero_grad(set_to_none=True)
+                x = x_data.detach().clone().requires_grad_(True)
+                y = model(x)
+                y.float().square().mean().backward()
+        else:
+            raise ValueError(f"Unsupported pass: {pass_name}")
+    elif impl == "legacy_reference":
+        if pass_name == "forward":
+            model.eval()
+
+            @torch.inference_mode()
+            def fn() -> None:
+                _run_legacy_static_c_mamba2_simple(model, x_data)
+        elif pass_name == "forward_backward":
+            model.train()
+
+            def fn() -> None:
+                model.zero_grad(set_to_none=True)
+                x = x_data.detach().clone().requires_grad_(True)
+                y = _run_legacy_static_c_mamba2_simple(model, x)
+                y.float().square().mean().backward()
+        else:
+            raise ValueError(f"Unsupported pass: {pass_name}")
+    else:
+        raise ValueError(f"Unsupported impl: {impl}")
+
+    ms = benchmark_ms(fn, warmup=warmup, rep=rep)
+    toks_per_sec = batch * seqlen / (ms / 1000.0)
+    return BenchmarkResult(
+        family="mamba2_simple",
+        selective_read=False,
+        pass_name=pass_name,
+        batch=batch,
+        seqlen=seqlen,
+        d_model=d_model,
+        ms=ms,
+        toks_per_sec=toks_per_sec,
+        benchmark_group="static_c_baseline",
+        static_c_impl=impl,
     )
 
 
@@ -278,18 +388,18 @@ def print_static_c_impl_block(
     if not results:
         return
     print()
-    print(f"[{pass_name}] static-C impl batch={batch} seqlen={seqlen} d_model={d_model}")
-    print(f"{'impl':<14} {'ms':>12} {'tok/s':>16} {'collapsed/legacy':>18}")
+    print(f"[{pass_name}] static-C baseline batch={batch} seqlen={seqlen} d_model={d_model}")
+    print(f"{'impl':<18} {'ms':>12} {'tok/s':>16} {'reduced/legacy':>18}")
     by_impl = {r.static_c_impl: r for r in results}
-    legacy = by_impl.get("legacy_ssd")
-    collapsed = by_impl.get("collapsed")
-    for impl in ["legacy_ssd", "collapsed"]:
+    legacy = by_impl.get("legacy_reference")
+    reduced = by_impl.get("reduced")
+    for impl in ["legacy_reference", "reduced"]:
         result = by_impl.get(impl)
         print(
-            f"{impl:<14} "
+            f"{impl:<18} "
             f"{format_metric(result.ms if result is not None else None):>12} "
             f"{format_metric(result.toks_per_sec if result is not None else None):>16} "
-            f"{format_speedup(collapsed, legacy) if impl == 'collapsed' else '':>18}"
+            f"{format_speedup(reduced, legacy) if impl == 'reduced' else '':>18}"
         )
         if result is not None and result.error is not None:
             print(f"  note: {impl}: {result.error}")
@@ -336,7 +446,6 @@ def main() -> None:
                             result = run_case(
                                 family=family,
                                 selective_read=selective_read,
-                                static_c_impl=None,
                                 benchmark_group="matrix",
                                 pass_name=pass_name,
                                 batch=args.batch,
@@ -379,13 +488,10 @@ def main() -> None:
                 )
                 static_c_impl_results: list[BenchmarkResult] = []
                 if "mamba2_simple" in args.families:
-                    for static_c_impl in ["legacy_ssd", "collapsed"]:
+                    for static_c_impl in ["legacy_reference", "reduced"]:
                         try:
-                            result = run_case(
-                                family="mamba2_simple",
-                                selective_read=False,
-                                static_c_impl=static_c_impl,
-                                benchmark_group="static_c_impl",
+                            result = run_static_c_baseline_case(
+                                impl=static_c_impl,
                                 pass_name=pass_name,
                                 batch=args.batch,
                                 seqlen=seqlen,
@@ -412,7 +518,7 @@ def main() -> None:
                                 d_model=d_model,
                                 ms=None,
                                 toks_per_sec=None,
-                                benchmark_group="static_c_impl",
+                                benchmark_group="static_c_baseline",
                                 static_c_impl=static_c_impl,
                                 error=f"{type(exc).__name__}: {exc}",
                             )
