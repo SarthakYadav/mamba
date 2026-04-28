@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Sarthak Yadav
 
 import argparse
+import gc
 import json
 from dataclasses import asdict, dataclass
 from typing import Callable
@@ -23,17 +24,21 @@ FAMILY_DISPLAY = {
     "mamba2_simple": "Mamba2Simple",
 }
 
+DTYPE_CHOICES = ["float16", "bfloat16", "float32"]
+
 
 @dataclass
 class BenchmarkResult:
     family: str
     selective_read: bool
     pass_name: str
+    dtype: str
     batch: int
     seqlen: int
     d_model: int
     ms: float | None
     toks_per_sec: float | None
+    peak_memory_mb: float | None = None
     benchmark_group: str = "matrix"
     static_c_impl: str | None = None
     error: str | None = None
@@ -43,14 +48,24 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Benchmark the 2x2 selective-read matrix for Mamba and Mamba2Simple "
-            "over multiple sequence lengths and embedding dimensions."
+            "across batch sizes, sequence lengths, embedding dimensions, and dtypes."
         )
     )
-    parser.add_argument("--batch", type=int, default=4)
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 16, 32])
     parser.add_argument("--seq-lens", type=int, nargs="+", default=[128, 512, 2048, 4096])
     parser.add_argument("--d-models", type=int, nargs="+", default=[256, 512, 1024])
-    parser.add_argument("--passes", choices=["forward", "forward_backward"], nargs="+", default=["forward", "forward_backward"])
-    parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="bfloat16")
+    parser.add_argument(
+        "--dtypes",
+        choices=DTYPE_CHOICES,
+        nargs="+",
+        default=["float16", "bfloat16", "float32"],
+    )
+    parser.add_argument(
+        "--passes",
+        choices=["forward", "forward_backward"],
+        nargs="+",
+        default=["forward", "forward_backward"],
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--rep", type=int, default=30)
     parser.add_argument("--d-state", type=int, default=64)
@@ -138,12 +153,34 @@ def make_input(*, batch: int, seqlen: int, d_model: int, device: str, dtype: tor
     return torch.randn(batch, seqlen, d_model, device=device, dtype=dtype)
 
 
+def _reset_cuda_state() -> None:
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
+
+def _is_oom(exc: BaseException) -> bool:
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    msg = str(exc).lower()
+    return "out of memory" in msg or "cuda oom" in msg
+
+
+def _time_with_memory(fn: Callable[[], None], *, warmup: int, rep: int) -> tuple[float, float]:
+    """Run the bench while tracking peak device memory (in MiB)."""
+    _reset_cuda_state()
+    ms = benchmark_ms(fn, warmup=warmup, rep=rep)
+    peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+    return ms, peak_mb
+
+
 def run_case(
     *,
     family: str,
     selective_read: bool,
     benchmark_group: str,
     pass_name: str,
+    dtype_str: str,
     batch: int,
     seqlen: int,
     d_model: int,
@@ -188,17 +225,19 @@ def run_case(
     else:
         raise ValueError(f"Unsupported pass: {pass_name}")
 
-    ms = benchmark_ms(fn, warmup=warmup, rep=rep)
+    ms, peak_mb = _time_with_memory(fn, warmup=warmup, rep=rep)
     toks_per_sec = batch * seqlen / (ms / 1000.0)
     return BenchmarkResult(
         family=family,
         selective_read=selective_read,
         pass_name=pass_name,
+        dtype=dtype_str,
         batch=batch,
         seqlen=seqlen,
         d_model=d_model,
         ms=ms,
         toks_per_sec=toks_per_sec,
+        peak_memory_mb=peak_mb,
         benchmark_group=benchmark_group,
     )
 
@@ -237,6 +276,7 @@ def run_static_c_baseline_case(
     *,
     impl: str,
     pass_name: str,
+    dtype_str: str,
     batch: int,
     seqlen: int,
     d_model: int,
@@ -301,17 +341,19 @@ def run_static_c_baseline_case(
     else:
         raise ValueError(f"Unsupported impl: {impl}")
 
-    ms = benchmark_ms(fn, warmup=warmup, rep=rep)
+    ms, peak_mb = _time_with_memory(fn, warmup=warmup, rep=rep)
     toks_per_sec = batch * seqlen / (ms / 1000.0)
     return BenchmarkResult(
         family="mamba2_simple",
         selective_read=False,
         pass_name=pass_name,
+        dtype=dtype_str,
         batch=batch,
         seqlen=seqlen,
         d_model=d_model,
         ms=ms,
         toks_per_sec=toks_per_sec,
+        peak_memory_mb=peak_mb,
         benchmark_group="static_c_baseline",
         static_c_impl=impl,
     )
@@ -332,15 +374,17 @@ def print_shape_block(
     *,
     families: list[str],
     pass_name: str,
+    dtype_str: str,
     batch: int,
     seqlen: int,
     d_model: int,
 ) -> None:
     print()
-    print(f"[{pass_name}] batch={batch} seqlen={seqlen} d_model={d_model}")
+    print(f"[{pass_name}] dtype={dtype_str} batch={batch} seqlen={seqlen} d_model={d_model}")
     print(
         f"{'family':<14} {'read=True ms':>12} {'read=False ms':>13} "
-        f"{'false/true':>11} {'read=True tok/s':>16} {'read=False tok/s':>17}"
+        f"{'false/true':>11} {'mem_T MB':>10} {'mem_F MB':>10} "
+        f"{'read=True tok/s':>16} {'read=False tok/s':>17}"
     )
     for family in families:
         family_results = {r.selective_read: r for r in results if r.family == family}
@@ -348,11 +392,15 @@ def print_shape_block(
         read_false = family_results.get(False)
         read_true_toks = read_true.toks_per_sec if read_true is not None else None
         read_false_toks = read_false.toks_per_sec if read_false is not None else None
+        read_true_mem = read_true.peak_memory_mb if read_true is not None else None
+        read_false_mem = read_false.peak_memory_mb if read_false is not None else None
         print(
             f"{FAMILY_DISPLAY[family]:<14} "
             f"{format_metric(read_true.ms if read_true is not None else None):>12} "
             f"{format_metric(read_false.ms if read_false is not None else None):>13} "
             f"{format_speedup(read_false, read_true):>11} "
+            f"{format_metric(read_true_mem):>10} "
+            f"{format_metric(read_false_mem):>10} "
             f"{format_metric(read_true_toks):>16} "
             f"{format_metric(read_false_toks):>17}"
         )
@@ -381,6 +429,7 @@ def print_static_c_impl_block(
     results: list[BenchmarkResult],
     *,
     pass_name: str,
+    dtype_str: str,
     batch: int,
     seqlen: int,
     d_model: int,
@@ -388,8 +437,11 @@ def print_static_c_impl_block(
     if not results:
         return
     print()
-    print(f"[{pass_name}] static-C baseline batch={batch} seqlen={seqlen} d_model={d_model}")
-    print(f"{'impl':<18} {'ms':>12} {'tok/s':>16} {'reduced/legacy':>18}")
+    print(
+        f"[{pass_name}] static-C baseline dtype={dtype_str} batch={batch} "
+        f"seqlen={seqlen} d_model={d_model}"
+    )
+    print(f"{'impl':<18} {'ms':>12} {'mem MB':>10} {'tok/s':>16} {'reduced/legacy':>18}")
     by_impl = {r.static_c_impl: r for r in results}
     legacy = by_impl.get("legacy_reference")
     reduced = by_impl.get("reduced")
@@ -398,6 +450,7 @@ def print_static_c_impl_block(
         print(
             f"{impl:<18} "
             f"{format_metric(result.ms if result is not None else None):>12} "
+            f"{format_metric(result.peak_memory_mb if result is not None else None):>10} "
             f"{format_metric(result.toks_per_sec if result is not None else None):>16} "
             f"{format_speedup(reduced, legacy) if impl == 'reduced' else '':>18}"
         )
@@ -416,6 +469,24 @@ def validate_args(args: argparse.Namespace) -> None:
                 )
 
 
+def _safe_run(
+    factory: Callable[[], BenchmarkResult],
+    *,
+    fallback: Callable[[str | None], BenchmarkResult],
+    strict: bool,
+) -> BenchmarkResult:
+    try:
+        return factory()
+    except Exception as exc:
+        if strict and not _is_oom(exc):
+            raise
+        tag = "OOM" if _is_oom(exc) else f"{type(exc).__name__}: {exc}"
+        _reset_cuda_state()
+        return fallback(tag)
+    finally:
+        _reset_cuda_state()
+
+
 def main() -> None:
     args = parse_args()
     validate_args(args)
@@ -423,114 +494,133 @@ def main() -> None:
         raise SystemExit("CUDA not available")
 
     device = "cuda"
-    dtype = getattr(torch, args.dtype)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(
         "Benchmarking selective-read matrix with "
-        f"dtype={args.dtype} batch={args.batch} d_state={args.d_state} "
-        f"d_conv={args.d_conv} expand={args.expand} headdim={args.headdim} ngroups={args.ngroups}"
+        f"batch_sizes={args.batch_sizes} dtypes={args.dtypes} "
+        f"d_state={args.d_state} d_conv={args.d_conv} expand={args.expand} "
+        f"headdim={args.headdim} ngroups={args.ngroups}"
     )
     print(f"families={','.join(args.families)} passes={','.join(args.passes)}")
 
     all_results: list[BenchmarkResult] = []
     for pass_name in args.passes:
-        for d_model in args.d_models:
-            for seqlen in args.seq_lens:
-                shape_results: list[BenchmarkResult] = []
-                for family in args.families:
-                    for selective_read in [True, False]:
-                        try:
-                            result = run_case(
-                                family=family,
-                                selective_read=selective_read,
-                                benchmark_group="matrix",
+        for dtype_str in args.dtypes:
+            dtype = getattr(torch, dtype_str)
+            for batch in args.batch_sizes:
+                for d_model in args.d_models:
+                    for seqlen in args.seq_lens:
+                        shape_results: list[BenchmarkResult] = []
+                        for family in args.families:
+                            for selective_read in [True, False]:
+                                def _fallback(err: str | None, *,
+                                              family=family, selective_read=selective_read,
+                                              pass_name=pass_name, dtype_str=dtype_str,
+                                              batch=batch, seqlen=seqlen, d_model=d_model) -> BenchmarkResult:
+                                    return BenchmarkResult(
+                                        family=family,
+                                        selective_read=selective_read,
+                                        pass_name=pass_name,
+                                        dtype=dtype_str,
+                                        batch=batch,
+                                        seqlen=seqlen,
+                                        d_model=d_model,
+                                        ms=None,
+                                        toks_per_sec=None,
+                                        peak_memory_mb=None,
+                                        benchmark_group="matrix",
+                                        error=err,
+                                    )
+                                result = _safe_run(
+                                    lambda family=family, selective_read=selective_read: run_case(
+                                        family=family,
+                                        selective_read=selective_read,
+                                        benchmark_group="matrix",
+                                        pass_name=pass_name,
+                                        dtype_str=dtype_str,
+                                        batch=batch,
+                                        seqlen=seqlen,
+                                        d_model=d_model,
+                                        d_state=args.d_state,
+                                        d_conv=args.d_conv,
+                                        expand=args.expand,
+                                        headdim=args.headdim,
+                                        ngroups=args.ngroups,
+                                        device=device,
+                                        dtype=dtype,
+                                        warmup=args.warmup,
+                                        rep=args.rep,
+                                    ),
+                                    fallback=_fallback,
+                                    strict=args.strict,
+                                )
+                                shape_results.append(result)
+                                all_results.append(result)
+                        print_shape_block(
+                            shape_results,
+                            families=args.families,
+                            pass_name=pass_name,
+                            dtype_str=dtype_str,
+                            batch=batch,
+                            seqlen=seqlen,
+                            d_model=d_model,
+                        )
+                        static_c_impl_results: list[BenchmarkResult] = []
+                        if "mamba2_simple" in args.families:
+                            for static_c_impl in ["legacy_reference", "reduced"]:
+                                def _baseline_fallback(err: str | None, *,
+                                              static_c_impl=static_c_impl,
+                                              pass_name=pass_name, dtype_str=dtype_str,
+                                              batch=batch, seqlen=seqlen, d_model=d_model) -> BenchmarkResult:
+                                    return BenchmarkResult(
+                                        family="mamba2_simple",
+                                        selective_read=False,
+                                        pass_name=pass_name,
+                                        dtype=dtype_str,
+                                        batch=batch,
+                                        seqlen=seqlen,
+                                        d_model=d_model,
+                                        ms=None,
+                                        toks_per_sec=None,
+                                        peak_memory_mb=None,
+                                        benchmark_group="static_c_baseline",
+                                        static_c_impl=static_c_impl,
+                                        error=err,
+                                    )
+                                result = _safe_run(
+                                    lambda static_c_impl=static_c_impl: run_static_c_baseline_case(
+                                        impl=static_c_impl,
+                                        pass_name=pass_name,
+                                        dtype_str=dtype_str,
+                                        batch=batch,
+                                        seqlen=seqlen,
+                                        d_model=d_model,
+                                        d_state=args.d_state,
+                                        d_conv=args.d_conv,
+                                        expand=args.expand,
+                                        headdim=args.headdim,
+                                        ngroups=args.ngroups,
+                                        device=device,
+                                        dtype=dtype,
+                                        warmup=args.warmup,
+                                        rep=args.rep,
+                                    ),
+                                    fallback=_baseline_fallback,
+                                    strict=args.strict,
+                                )
+                                static_c_impl_results.append(result)
+                                all_results.append(result)
+                            print_static_c_impl_block(
+                                static_c_impl_results,
                                 pass_name=pass_name,
-                                batch=args.batch,
+                                dtype_str=dtype_str,
+                                batch=batch,
                                 seqlen=seqlen,
                                 d_model=d_model,
-                                d_state=args.d_state,
-                                d_conv=args.d_conv,
-                                expand=args.expand,
-                                headdim=args.headdim,
-                                ngroups=args.ngroups,
-                                device=device,
-                                dtype=dtype,
-                                warmup=args.warmup,
-                                rep=args.rep,
                             )
-                        except Exception as exc:
-                            if args.strict:
-                                raise
-                            result = BenchmarkResult(
-                                family=family,
-                                selective_read=selective_read,
-                                pass_name=pass_name,
-                                batch=args.batch,
-                                seqlen=seqlen,
-                                d_model=d_model,
-                                ms=None,
-                                toks_per_sec=None,
-                                benchmark_group="matrix",
-                                error=f"{type(exc).__name__}: {exc}",
-                            )
-                        shape_results.append(result)
-                        all_results.append(result)
-                print_shape_block(
-                    shape_results,
-                    families=args.families,
-                    pass_name=pass_name,
-                    batch=args.batch,
-                    seqlen=seqlen,
-                    d_model=d_model,
-                )
-                static_c_impl_results: list[BenchmarkResult] = []
-                if "mamba2_simple" in args.families:
-                    for static_c_impl in ["legacy_reference", "reduced"]:
-                        try:
-                            result = run_static_c_baseline_case(
-                                impl=static_c_impl,
-                                pass_name=pass_name,
-                                batch=args.batch,
-                                seqlen=seqlen,
-                                d_model=d_model,
-                                d_state=args.d_state,
-                                d_conv=args.d_conv,
-                                expand=args.expand,
-                                headdim=args.headdim,
-                                ngroups=args.ngroups,
-                                device=device,
-                                dtype=dtype,
-                                warmup=args.warmup,
-                                rep=args.rep,
-                            )
-                        except Exception as exc:
-                            if args.strict:
-                                raise
-                            result = BenchmarkResult(
-                                family="mamba2_simple",
-                                selective_read=False,
-                                pass_name=pass_name,
-                                batch=args.batch,
-                                seqlen=seqlen,
-                                d_model=d_model,
-                                ms=None,
-                                toks_per_sec=None,
-                                benchmark_group="static_c_baseline",
-                                static_c_impl=static_c_impl,
-                                error=f"{type(exc).__name__}: {exc}",
-                            )
-                        static_c_impl_results.append(result)
-                        all_results.append(result)
-                    print_static_c_impl_block(
-                        static_c_impl_results,
-                        pass_name=pass_name,
-                        batch=args.batch,
-                        seqlen=seqlen,
-                        d_model=d_model,
-                    )
 
     if args.json_out is not None:
         with open(args.json_out, "w") as f:
